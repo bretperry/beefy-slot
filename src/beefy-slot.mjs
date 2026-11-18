@@ -16,13 +16,13 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Knobs: the load past which heavy work waits, and a lock's default life.
-// The line is LOAD_MAX, or LOAD_PER_CORE per core when that is higher. Why per core: a flat 3 sat
+// The limit is LOAD_MAX, or LOAD_PER_CORE per core when that is higher. Why per core: a flat 3 sat
 // under an idle desktop's own load (3.2–3.5 on a laptop), so every heavy step needed a waiver, and a
-// gate everyone waives guards nothing; a forgotten Simulator (load ~350) still trips it anywhere.
+// limit everyone waives guards nothing; a forgotten Simulator (load ~350) still trips it anywhere.
 // Why 1 per core, not less: a load up to the core count means the cores are busy, not oversubscribed
-// (work is not yet queueing for a core); at 0.75 a shared 10-core Mac still closed the gate on its
+// (work is not yet queueing for a core); at 0.75 a shared 10-core Mac still hit the limit on its
 // agents' ordinary builds. Past the core count, timing-sensitive work (Simulator UI tests, perf
-// numbers) goes flaky and stacked builds slow each other, so the line stops there.
+// numbers) goes flaky and stacked builds slow each other, so the limit stops there.
 export const LOAD_MAX = 3;
 export const LOAD_PER_CORE = 1;
 export const DEFAULT_TTL_MINUTES = 60;
@@ -35,8 +35,8 @@ export const HEAVY = "heavy";
 export const DEFAULT_HEAVY_SLOTS = 1;
 export const MAX_SLOTS = 16;
 
-// The reserved resource for strict perf runs, and its load line. Why 1.5: a perf run measures frames and
-// timings, and one other busy core already moves them; the heavy-work line (a core per core) is for
+// The reserved resource for strict perf runs, and its load limit. Why 1.5: a perf run measures frames and
+// timings, and one other busy core already moves them; the heavy-work limit (a core per core) is for
 // builds that only need to finish.
 export const PERF = "perf";
 export const PERF_LOAD_MAX = 1.5;
@@ -126,7 +126,7 @@ const resourceSettings = (resources) => {
 export const slotsFor = (resource, settings) => resource === HEAVY ? settings.heavySlots : settings.resources?.[resource]?.slots ?? 1;
 // True when the machine sets the resource's slot count (a config entry), so a flag never does.
 export const slotsFixed = (resource, settings) => resource !== HEAVY && (settings.resources?.[resource]?.slots ?? null) !== null;
-// False for a named resource whose config entry turns its load gate off; every other resource is gated.
+// False for a named resource whose config entry turns its load limit off; every other resource is gated.
 export const loadGated = (resource, settings) => resource === HEAVY || resource === PERF || settings.resources?.[resource]?.loadGate !== false;
 export const perfLoadLine = (settings) => settings.perfLoadMax;
 export const loadLine = (settings) => settings.loadMax;
@@ -283,8 +283,7 @@ const GUARD_STALE_MS = 10_000;
 const NO_LINKS = ["EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EXDEV", "EMLINK"];
 export const linkFailure = (error, path) => {
   if (!NO_LINKS.includes(error?.code)) return error;
-  const why = ["EPERM", "EMLINK"].includes(error.code) ? "the folder may not support hard links, or you may lack permission to make one there" : "the folder does not support hard links";
-  return Object.assign(new Error(`beefy-slot: could not hard-link a lock in lockDir ${dirname(path)} (${error.code}); ${why}, and the lock needs them. Set lockDir in beefy-slot.json or BEEFY_SLOT_LOCK_DIR to a folder on a local disk you can write to.`), { code: "ENOHARDLINK", cause: error });
+  return Object.assign(new Error(`beefy-slot: could not create a lock in ${dirname(path)} (${error.code}): this folder may not support hard links, or you may not be allowed to write there. Set lockDir in beefy-slot.json or BEEFY_SLOT_LOCK_DIR to a local folder you can write to.`), { code: "ENOHARDLINK", cause: error });
 };
 
 // Creates the lock file with its whole record or not at all: written aside, then hard-linked into
@@ -332,7 +331,7 @@ const takeOne = ({ dir, resource, as, id, slots = 1, watch, worker, ttl = DEFAUL
   const record = JSON.stringify({ resource, as, id: recordId, slots, at: now.toISOString(), until: new Date(now.getTime() + ttl * 60_000).toISOString(), pid: process.pid, ...(watch === undefined ? {} : { watch }), ...(worker ? { worker } : {}), ...(mine && held.keeper ? { keeper: held.keeper } : {}), ...(waived ? { waived } : {}) });
   const busy = () => {
     const current = holder(dir, resource);
-    return { ok: false, reason: `${resource} is held by ${current?.as ?? "someone"} until ${current?.until ?? "?"}; wait, or skip and say so. Never attach to it or kill it.` };
+    return { ok: false, reason: `${resource} is held by ${current?.as ?? "someone"} until ${current?.until ?? "?"}. Try again later, or use --wait <minutes> to queue.` };
   };
   // Yours already: refresh the TTL.
   if (mine) {
@@ -366,7 +365,7 @@ const takeOne = ({ dir, resource, as, id, slots = 1, watch, worker, ttl = DEFAUL
 };
 
 // A waiver is a record, not a sentence in chat: one file per (resource, holder), so waiving for one
-// agent never replaces another's. It excuses the load line only, never a full resource.
+// agent never replaces another's. It excuses the load limit only, never a full resource.
 const waiverName = (resource, as) => `${resource}~waiver~${createHash("sha256").update(as).digest("hex").slice(0, 12)}`;
 
 // The live waiver for this holder on this resource, or null.
@@ -381,7 +380,7 @@ const logWaiver = (dir, entry) => {
   appendFileSync(join(dir, "waivers.log"), `${JSON.stringify(entry)}\n`);
 };
 
-// Records a waiver of the load line for `as` on `resource`: { ok: true, until } | { ok: false, reason }.
+// Records a waiver of the load limit for `as` on `resource`: { ok: true, until } | { ok: false, reason }.
 // The reason is required and kept, in the waiver and in waivers.log. Renewing a live waiver keeps its
 // first start (`first`), and no chain of renewals runs past MAX_WAIVER_MINUTES from it.
 export const waive = ({ dir, resource, as, reason, ttl = WAIVER_TTL_MINUTES, now = new Date() }) => {
@@ -399,8 +398,8 @@ export const waive = ({ dir, resource, as, reason, ttl = WAIVER_TTL_MINUTES, now
 };
 
 // One look at the slots: the first the taker already holds (refreshed), else the first free one.
-// The load line is checked once, first; over it, only a live waiver or --ignore-load gets through.
-// `loadMax` is the load line; `busiest` names the top CPU process for a load refusal.
+// The load limit is checked once, first; over it, only a live waiver or --ignore-load gets through.
+// `loadMax` is the load limit; `busiest` names the top CPU process for a load refusal.
 // A live holder's recorded count caps the slots this take may use: it never shares a resource
 // with someone who took it for fewer. Not when `fixed`: the machine's config sets that resource's count,
 // so a raised count is open to the next take at once, whatever the holders took it with.
@@ -410,7 +409,7 @@ const takeSlots = ({ dir, resource, as, id, slots = 1, fixed = false, worker, lo
     const waiver = ignoreLoad ? { reason: reason ?? "--ignore-load", at: now.toISOString() } : activeWaiver(dir, resource, as, now);
     if (!waiver) {
       const top = busiest();
-      return { ok: false, reason: `the 1-minute load is ${load.toFixed(1)}, above ${loadMax.toFixed(1)}${top ? `; busiest process: ${top}` : ""}; wait, or skip and say so` };
+      return { ok: false, reason: `the machine is busy: 1-minute load is ${load.toFixed(1)}, above the limit of ${loadMax.toFixed(1)}${top ? `; busiest process: ${top}` : ""}. Try again later.` };
     }
     waived = { reason: waiver.reason, at: waiver.at };
   }
@@ -427,8 +426,8 @@ const takeSlots = ({ dir, resource, as, id, slots = 1, fixed = false, worker, lo
   // while a holder sits in a higher slot must not let a new take join the others in the lower ones.
   if (fixed && live.length >= cap) {
     return cap === 1
-      ? { ok: false, reason: `${resource} is held by ${live[0].as} until ${live[0].until}; wait, or skip and say so. Never attach to it or kill it.` }
-      : { ok: false, reason: `all ${cap} ${resource} slots are held (${live.map((held) => `${held.as} until ${held.until}`).join(", ")}); wait, or skip and say so. Never attach to one or kill its holder.` };
+      ? { ok: false, reason: `${resource} is held by ${live[0].as} until ${live[0].until}. Try again later, or use --wait <minutes> to queue.` }
+      : { ok: false, reason: `all ${cap} ${resource} slots are held (${live.map((held) => `${held.as} until ${held.until}`).join(", ")}). Try again later, or queue with --wait <minutes>.` };
   }
   let last;
   for (const name of slotNames(resource, cap)) {
@@ -437,10 +436,10 @@ const takeSlots = ({ dir, resource, as, id, slots = 1, fixed = false, worker, lo
   }
   if (cap < slots) {
     const limiter = live.find((held) => (slotCount(held.slots) ?? 1) < slots);
-    return { ok: false, reason: `${resource} is held by ${limiter?.as ?? "someone"} until ${limiter?.until ?? "?"}, who took it with ${cap} slot${cap === 1 ? "" : "s"}; a take for ${slots} cannot share it. Wait, or skip and say so. Never attach to it or kill it.` };
+    return { ok: false, reason: `${resource} is held by ${limiter?.as ?? "someone"} until ${limiter?.until ?? "?"}, who took it with ${cap} slot${cap === 1 ? "" : "s"}; a take for ${slots} cannot share it. Try again later, or use the same --slots.` };
   }
   if (cap === 1) return last;
-  return { ok: false, reason: `all ${cap} ${resource} slots are held (${live.map((held) => `${held.as} until ${held.until}`).join(", ")}); wait, or skip and say so. Never attach to one or kill its holder.` };
+  return { ok: false, reason: `all ${cap} ${resource} slots are held (${live.map((held) => `${held.as} until ${held.until}`).join(", ")}). Try again later, or queue with --wait <minutes>.` };
 };
 
 // Blocks the thread for `ms` (the queue's wait has nothing else to do).
@@ -514,7 +513,7 @@ export const heldBy = ({ dir, resource, settings, now = new Date(), probe }) => 
   });
 };
 
-const USAGE = "usage: beefy-slot take <resource> --as <who> [--ttl <minutes>] [--slots <n>] [--wait <minutes>] [--worker <pid>] [--ignore-load --reason <why>] | free <resource> --as <who> | status [<resource>] | waive <resource> --as <who> --reason <why> [--ttl <minutes>] | run <resource> [--as <who>] [--ttl <minutes>] [--slots <n>] [--wait <minutes>] [--ignore-load --reason <why>] -- <command…>";
+export const USAGE = "usage: beefy-slot <command> …\n  take <resource> --as <who> [--ttl <minutes>] [--slots <n>] [--wait <minutes>] [--worker <pid>] [--ignore-load --reason <why>]\n  free <resource> --as <who>\n  status [<resource>]\n  waive <resource> --as <who> --reason <why> [--ttl <minutes>]\n  run <resource> [--as <who>] [--ttl <minutes>] [--slots <n>] [--wait <minutes>] [--ignore-load --reason <why>] -- <command…>\n  perf take --as <who> [--wait <minutes>] [--ttl <minutes>] | free --as <who> | status | waive --as <who> --reason <why>\n  --version";
 
 // Flags before `--`, and the command after it. `error` is a flag that is recognised but out of range.
 const parse = (args) => {
@@ -587,9 +586,9 @@ const defaultSpawn = (command, { env, keep }) => {
 };
 
 /** @returns {string | null} */
-const defaultRefusal = () => "no command guard was loaded";
+const defaultRefusal = () => "no judge was loaded";
 
-// Returns the exit code: 0 done, 75 busy, 1 refused (also a command the guard stops), 2 usage; `run` returns its command's code.
+// Returns the exit code: 0 done, 75 busy, 1 refused (also a command the judge stops), 2 usage; `run` returns its command's code.
 export const main = (argv, { settings, now: nowGiven, load = loadavg()[0], busiest = busiestProcess, spawn = defaultSpawn, refusal = defaultRefusal, out = console.log, err = console.error, probe, sleep = pause } = {}) => {
   const [verb, ...args] = argv;
   const now = nowGiven ?? new Date();
@@ -605,7 +604,7 @@ export const main = (argv, { settings, now: nowGiven, load = loadavg()[0], busie
     err(`beefy-slot: ${opts.error}`);
     return 2;
   }
-  // A resource whose config entry turns the load gate off never waits on the load: the line is out of reach.
+  // A resource whose config entry turns the load limit off never waits on the load: the line is out of reach.
   const loadMax = verb === "keep" ? 0 : resource === PERF ? perfLoadLine(settings) : loadGated(resource, settings) ? loadLine(settings) : Number.POSITIVE_INFINITY;
   if (verb === "status") {
     const safe = resource === undefined ? undefined : safeName(resource);
@@ -625,7 +624,7 @@ export const main = (argv, { settings, now: nowGiven, load = loadavg()[0], busie
       err(`beefy-slot: ${waived.reason}`);
       return 2;
     }
-    out(`waived the load line on ${resource} for ${opts.as} until ${waived.until}`);
+    out(`waived the load limit on ${resource} for ${opts.as} until ${waived.until}`);
     return 0;
   }
   if (verb === "keep") {
@@ -657,11 +656,11 @@ export const main = (argv, { settings, now: nowGiven, load = loadavg()[0], busie
       return 2;
     }
     if (resource === PERF && opts.worker !== undefined) {
-      err(`beefy-slot: ${PERF} is one holder on its own load line; --worker is not accepted`);
+      err(`beefy-slot: ${PERF} is one holder on its own load limit; --worker is not accepted`);
       return 2;
     }
     if (resource === PERF && (opts.slots !== undefined || opts.ignoreLoad)) {
-      err(`beefy-slot: ${PERF} is one holder on its own load line; --slots and --ignore-load are not accepted (waive the line with \`waive\`)`);
+      err(`beefy-slot: ${PERF} is one holder with its own load limit; --slots and --ignore-load are not accepted. Use \`waive\` to excuse the limit.`);
       return 2;
     }
     if (opts.ignoreLoad && !opts.reason) {
@@ -671,7 +670,7 @@ export const main = (argv, { settings, now: nowGiven, load = loadavg()[0], busie
   }
   if (verb === "take" || verb === "free") {
     if (!opts.as) {
-      err(`${USAGE}\nbeefy-slot: say who you are with --as (your branch or thread)`);
+      err(`${USAGE}\nbeefy-slot: --as <who> is required: a name for this job, such as my-build`);
       return 2;
     }
     // The slot lives while the worker does: its identity goes in the record, and a keeper (below) renews it.

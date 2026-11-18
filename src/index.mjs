@@ -3,7 +3,7 @@
 // Exports: main, resolveSettings, findConfig, validate, loadJudge, lock constants and helpers.
 
 import { sep } from "node:path";
-import { main as lockMain, resolveSettings } from "./beefy-slot.mjs";
+import { USAGE, main as lockMain, resolveSettings } from "./beefy-slot.mjs";
 import { main as perfMain } from "./perf.mjs";
 import { sinkRefusal } from "./judge.mjs";
 
@@ -17,15 +17,20 @@ const DIR_ERRORS = ["ENOTDIR", "EEXIST", "EACCES", "EPERM", "EROFS", "ENOENT", "
 // True when the error's path is the lockDir, something inside it, or a parent on the way to it (its creation).
 const aboutLockDir = (error, dir) => typeof error?.path === "string" && (error.path === dir || error.path.startsWith(dir + sep) || dir.startsWith(error.path.endsWith(sep) ? error.path : error.path + sep));
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.2.1";
 
 export const main = (argv, options = {}) => {
   if (argv[0] === "--version") {
     (options.out ?? console.log)(VERSION);
     return 0;
   }
+  if (argv[0] === "--help") {
+    (options.out ?? console.log)(USAGE);
+    return 0;
+  }
   const settings = options.settings ?? resolveSettings(options);
   const verb = argv[0] === "perf" ? argv[1] : argv[0];
+  // A malformed beefy-slot.json blocks `free` too: it may have moved lockDir, and freeing in the wrong folder would leave the real lock held.
   if (options.configError && verb !== "status") {
     (options.err ?? console.error)(options.configError);
     return 2;

@@ -83,8 +83,8 @@ describe("config", () => {
   it("explains a folder without hard links and passes other errors through", () => {
     const refused = linkFailure(Object.assign(new Error("x"), { code: "EPERM" }), "/mnt/share/locks/heavy.json");
     assert.equal(refused.code, "ENOHARDLINK");
-    assert.match(refused.message, /lockDir \/mnt\/share\/locks/);
-    assert.match(refused.message, /permission/);
+    assert.match(refused.message, /could not create a lock in \/mnt\/share\/locks \(EPERM\)/);
+    assert.match(refused.message, /not be allowed to write/);
     assert.match(refused.message, /lockDir/);
     const other = Object.assign(new Error("y"), { code: "ENOSPC" });
     assert.equal(linkFailure(other, "/x/y.json"), other);

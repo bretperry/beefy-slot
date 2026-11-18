@@ -16,7 +16,7 @@ import { BUSY, busiestProcess, LOAD_MAX, LOAD_PER_CORE, holder, loadLine, main, 
 const NOW = new Date("2026-10-20T12:00:00Z");
 const later = (minutes) => new Date(NOW.getTime() + minutes * 60_000);
 
-// A fresh lock dir and a quiet main (its guard allows everything unless a test passes one): { run(argv, opts) → code, dir, errors }.
+// A fresh lock dir and a quiet main (its judge allows everything unless a test passes one): { run(argv, opts) → code, dir, errors }.
 const setup = () => {
   const dir = mkdtempSync(join(tmpdir(), "lock-"));
   const errors = [];
@@ -85,7 +85,7 @@ describe("lock", () => {
     assert.equal(run(["take", "e2e", "--as", "a", "--ignore-load", "--reason", "test"], { load: LOAD_MAX + 1 }), 0);
   });
 
-  it("scales the load line with the cores, never below LOAD_MAX, and takes this machine's own setting", () => {
+  it("scales the load limit with the cores, never below LOAD_MAX, and takes this machine's own setting", () => {
     assert.equal(loadLine(resolveSettings({ env: {}, cores: 2 })), LOAD_MAX);
     assert.equal(loadLine(resolveSettings({ env: {}, cores: 10 })), 10 * LOAD_PER_CORE);
     assert.equal(loadLine(resolveSettings({ env: { BEEFY_SLOT_LOAD_MAX: "12" }, cores: 2 })), 12);
@@ -102,7 +102,7 @@ describe("lock", () => {
   it("names the busiest process when the load refuses", () => {
     const { run, errors } = setup();
     assert.equal(run(["take", "e2e", "--as", "a"], { load: 350, busiest: () => "4242 Simulator (380.5%)" }), BUSY);
-    assert.match(errors.at(-1), /load is 350\.0, above 3\.0; busiest process: 4242 Simulator \(380\.5%\)/);
+    assert.match(errors.at(-1), /load is 350\.0, above the limit of 3\.0; busiest process: 4242 Simulator \(380\.5%\)/);
     // The real ps answers in that shape, or not at all.
     assert.match(busiestProcess(), /^(\d+ .+ \([\d.]+%\))?$/);
   });
@@ -144,13 +144,14 @@ describe("lock run: the sink check", () => {
     }
   });
 
-  it("refuses what the guard denies, before taking the lock or spawning", () => {
+  it("refuses what the judge denies, before taking the lock or spawning", () => {
     const { dir, run, errors } = setup();
     let ran = false;
     assert.equal(run(["run", "e2e", "--", "git", "push", "-f", "origin", "main"], { judge: DENY, spawn: () => ((ran = true), 0) }), 1);
     assert.equal(ran, false);
     assert.equal(holder(dir, "e2e"), null);
     assert.match(errors.at(-1), /refused.*git push -f origin main.*\(deny\): no pushes/);
+    assert.match(errors.at(-1), /`run` cannot ask for confirmation, so it does not start a command the judge would deny or ask about\./);
   });
 
   it("refuses an ask too: lock runs unattended, so nobody can confirm", () => {
@@ -161,13 +162,20 @@ describe("lock run: the sink check", () => {
     assert.match(errors.at(-1), /\(ask\): merge needs the user/);
   });
 
-  it("fails closed: a guard that throws, answers oddly, or was never given refuses", () => {
+  it("fails closed: a judge that throws, answers oddly, or was never given refuses", () => {
     for (const options of [{ judge: () => { throw new Error("boom"); } }, { judge: () => undefined }, { judge: () => ({ decision: "allow" }) }, { judge: () => "ok" }, { judge: undefined }]) {
       const { run, errors } = setup();
       let ran = false;
       assert.equal(run(["run", "e2e", "--", "echo", "hi"], { spawn: () => ((ran = true), 0), ...options }), 1, JSON.stringify(Object.keys(options)));
       assert.equal(ran, false);
       assert.match(errors.at(-1), /refused/);
+    }
+  });
+
+  it("says why a judge that failed or answered oddly stops the command", () => {
+    assert.match(sinkRefusal(["echo", "hi"], () => { throw new Error("boom"); }), /^the judge failed \(boom\), so `echo hi` is not run$/);
+    for (const verdict of [undefined, { decision: "allow" }, "ok"]) {
+      assert.match(sinkRefusal(["echo", "hi"], () => verdict), /^the judge returned an answer beefy-slot cannot read for `echo hi`, so it is not run$/);
     }
   });
 

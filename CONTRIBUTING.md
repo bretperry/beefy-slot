@@ -1,8 +1,7 @@
 # Contributing
 
-`beefy-slot` is open source under the MIT License (see `LICENSE`), and **outside pull requests are not accepted yet**.
-The maintainer needs a contributor agreement in place before merging code from anyone else, so the
-project can still be relicensed. Until that exists, a pull request from outside will be closed unread.
+Outside pull requests are not accepted yet. Merging code from others needs a contributor agreement
+first, and none exists. A pull request now will be closed without review. Open an issue instead.
 
 What helps now:
 

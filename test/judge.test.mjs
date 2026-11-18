@@ -28,11 +28,11 @@ describe("judge", () => {
 
   it("refuses a missing, broken, throwing, or incomplete module", async () => {
     const dir = fixture();
-    assert.match(sinkRefusal(["echo", "hi"], await loadJudge("./missing.mjs", dir)), /command guard failed/);
+    assert.match(sinkRefusal(["echo", "hi"], await loadJudge("./missing.mjs", dir)), /judge failed/);
     for (const [i, source] of ["not valid JavaScript !", "throw new Error('import failed');", "export const other = () => null;", "export const judge = () => { throw new Error('judge failed'); };"].entries()) {
       const name = `judge${i}.mjs`;
       writeFileSync(join(dir, name), source);
-      assert.match(sinkRefusal(["echo", "hi"], await loadJudge(`./${name}`, dir)), /command guard failed/);
+      assert.match(sinkRefusal(["echo", "hi"], await loadJudge(`./${name}`, dir)), /judge failed/);
     }
   });
 
@@ -53,7 +53,7 @@ describe("judge", () => {
     const script = `import { loadJudge, sinkRefusal } from ${JSON.stringify(API)}; console.log(sinkRefusal(['echo', 'hi'], await loadJudge('./loop.mjs', ${JSON.stringify(dir)})));`;
     const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8", timeout: 8000 });
     assert.equal(result.status, 0, result.error?.message);
-    assert.match(result.stdout, /command guard failed .*timed out/s);
+    assert.match(result.stdout, /judge failed .*timed out/s);
   });
 
   it("a configured judge that cannot load refuses run while take, free, and status work", () => {
@@ -66,7 +66,7 @@ describe("judge", () => {
     const run = (...args) => spawnSync(process.execPath, [CLI, ...args], { cwd: dir, env, encoding: "utf8" });
     const result = run("run", "x", "--", process.execPath, "-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)}, '')`);
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /command guard failed/);
+    assert.match(result.stderr, /judge failed/);
     assert.equal(existsSync(marker), false);
     assert.equal(existsSync(locks), false);
     assert.equal(run("take", "x", "--as", "a").status, 0);

@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import { BUSY, MAX_WAIT_MINUTES, PERF, PERF_LOAD_MAX, resolveSettings } from "./beefy-slot.mjs";
 
-// The core owns the reserved resource and its load line.
+// The core owns the reserved resource and its load limit.
 export { PERF_LOAD_MAX };
 export const PERF_RESOURCE = PERF;
 
@@ -46,7 +46,7 @@ const defaultExec = ({ command, args, input, env }) => spawnSync(command, args, 
 // Blocks the thread for `ms`.
 const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
-const USAGE = "usage: beefy-slot perf take --as <who> [--wait <minutes>] [--ttl <minutes>] | free --as <who> | status | waive --as <who> --reason <why> [--ttl <minutes>]\nperf-queue: --ignore-load and --slots are not accepted; waive the load line with `waive`";
+const USAGE = "usage: beefy-slot perf take --as <who> [--wait <minutes>] [--ttl <minutes>] | free --as <who> | status | waive --as <who> --reason <why> [--ttl <minutes>]\nbeefy-slot perf: --ignore-load and --slots are not accepted; waive the load limit with `waive`";
 
 // Returns the exit code. The executor, core source reader, sleep and clock are test seams.
 export const main = (argv, { settings = resolveSettings(), exec = defaultExec, readSource = () => readFileSync(fileURLToPath(new URL("./beefy-slot.mjs", import.meta.url)), "utf8"), sleep = pause, clock = () => Date.now(), err = console.error } = {}) => {
@@ -62,7 +62,7 @@ export const main = (argv, { settings = resolveSettings(), exec = defaultExec, r
   if (at !== -1) {
     const value = flags[at + 1] ?? "";
     if (verb !== "take" || !/^\d+$/.test(value) || Number(value) > MAX_WAIT_MINUTES) {
-      err(`${USAGE}\nperf-queue: --wait is for take, 0 to ${MAX_WAIT_MINUTES} minutes`);
+      err(`${USAGE}\nbeefy-slot perf: --wait is for take, 0 to ${MAX_WAIT_MINUTES} minutes`);
       return 2;
     }
     wait = Number(value);
@@ -70,7 +70,7 @@ export const main = (argv, { settings = resolveSettings(), exec = defaultExec, r
   }
   const { host, loadMax } = perfSettings(settings);
   if (host && !HOST.test(host)) {
-    err(`perf-queue: the perf host "${host}" is not a host name ssh would take`);
+    err(`beefy-slot perf: the perf host "${host}" is not a host name ssh would take`);
     return 2;
   }
   const lockArgs = verb === "status" ? ["status", PERF] : [verb, PERF, ...lockFlags];
@@ -88,7 +88,7 @@ export const main = (argv, { settings = resolveSettings(), exec = defaultExec, r
     }
     if (result.stderr) err(result.stderr.trimEnd());
     if (answer === -1) {
-      err(`perf-queue: could not run the lock on ${host || "this machine"} (exit ${code}); is ssh set up for it, and is node on its PATH?`);
+      err(`beefy-slot perf: could not run the lock on ${host || "this machine"} (exit ${code}); is ssh set up for it, and is node on its PATH?`);
       return 1;
     }
     return answer;

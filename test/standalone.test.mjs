@@ -61,7 +61,7 @@ describe("standalone defaults", () => {
 
   it("prints the folder and judge on status's first line", () => {
     const { run, locks } = project();
-    assert.equal(run(["status"]).stdout.split("\n")[0], `beefy-slot 0.2.0 · folder ${locks} · judge none`);
+    assert.equal(run(["status"]).stdout.split("\n")[0], `beefy-slot 0.2.1 · folder ${locks} · judge none`);
   });
   it("uses BEEFY_SLOT_LOCK_DIR over the file's lockDir", () => {
     const { run, dir, locks } = project();

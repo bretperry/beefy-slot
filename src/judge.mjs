@@ -12,7 +12,7 @@ import { runInNewContext } from "node:vm";
 // characters, else in single quotes.
 export const shellQuote = (word) => (/^[A-Za-z0-9_@%+:,./-]+$/.test(word) ? word : `'${word.replace(/'/g, `'\\''`)}'`);
 
-// The command line the guard reads for an argv: the same array passed to spawn, one word per element.
+// The command line the judge reads for an argv: the same array passed to spawn, one word per element.
 export const quoteCommand = (argv) => argv.map(shellQuote).join(" ");
 
 // Import failures become a throwing judge, leaving all non-run verbs available.
@@ -31,21 +31,21 @@ export const loadJudge = async (spec, baseDir) => {
   }
 };
 
-// Why `argv` may not run, or null when the guard has no objection. Only a null verdict allows: a deny,
-// an ask, a verdict of any other shape, and a guard that throws all refuse.
+// Why `argv` may not run, or null when the judge has no objection. Only a null verdict allows: a deny,
+// an ask, a verdict of any other shape, and a judge that throws all refuse.
 export const sinkRefusal = (argv, guard, cwd = process.cwd()) => {
   const command = quoteCommand(argv);
   let verdict;
   try {
     verdict = guard(command, { argv, cwd });
   } catch (error) {
-    return `the command guard failed (${error instanceof Error ? error.message : String(error)}), so \`${command}\` is not run`;
+    return `the judge failed (${error instanceof Error ? error.message : String(error)}), so \`${command}\` is not run`;
   }
   if (verdict === null) return null;
   if (verdict?.decision === "deny" || verdict?.decision === "ask") {
     const why = verdict.decision === "deny" ? "refuses" : "needs the user to confirm";
-    return `the command guard ${why} \`${command}\` (${verdict.decision}): ${verdict.reason}. lock runs unattended, so it runs nothing the guard would stop or ask about; run the command on its own, where the guard can ask the user`;
+    return `the judge ${why} \`${command}\` (${verdict.decision}): ${verdict.reason}. \`run\` cannot ask for confirmation, so it does not start a command the judge would deny or ask about.`;
   }
-  return `the command guard gave an answer lock cannot read for \`${command}\`, so it is not run`;
+  return `the judge returned an answer beefy-slot cannot read for \`${command}\`, so it is not run`;
 };
 

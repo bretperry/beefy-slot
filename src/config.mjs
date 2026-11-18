@@ -9,12 +9,12 @@ const KEYS = ["lockDir", "heavySlots", "perfHost", "perfLoadMax", "judge", "reso
 const RESOURCE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 const RESERVED = { heavy: "heavySlots", perf: "perfLoadMax" };
 
-// A named resource's entry: only `slots` (1 to 16) and `loadGate` (false turns the load gate off).
+// A named resource's entry: only `slots` (1 to 16) and `loadGate` (false turns the load limit off).
 const validateResources = (resources) => {
   if (!resources || typeof resources !== "object" || Array.isArray(resources)) return "resources: expected an object of resource names";
   for (const [name, entry] of Object.entries(resources)) {
     if (!RESOURCE.test(name)) return `resources.${name}: not a resource name`;
-    if (Object.hasOwn(RESERVED, name)) return `resources.${name}: ${name} is reserved; ${name === "heavy" ? "its slots are" : "its load line is"} set by ${RESERVED[name]}`;
+    if (Object.hasOwn(RESERVED, name)) return `resources.${name}: ${name} is reserved; ${name === "heavy" ? "its slots are" : "its load limit is"} set by ${RESERVED[name]}`;
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) return `resources.${name}: expected an object`;
     for (const [key, value] of Object.entries(entry)) {
       if (key === "slots") {

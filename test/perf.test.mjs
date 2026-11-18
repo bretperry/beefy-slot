@@ -85,7 +85,7 @@ describe("perf command", () => {
     for (const status of [255, 127, null]) {
       const { code, errors } = drive(["take", "--as", "a"], { config: { perfHost: "perf-box" }, statuses: [status] });
       assert.equal(code, 1, String(status));
-      assert.match(errors.at(-1), /could not run the lock on perf-box/);
+      assert.match(errors.at(-1), /^beefy-slot perf: could not run the lock on perf-box/);
     }
   });
 
@@ -100,6 +100,14 @@ describe("perf command", () => {
       assert.equal(code, 2, host);
       assert.equal(calls.length, 0);
     }
+  });
+
+  it("starts every perf message with the beefy-slot perf: prefix", () => {
+    const usage = drive(["take", "--as", "a", "--slots", "2"]);
+    assert.match(usage.errors.at(-1), /^usage: beefy-slot perf take /);
+    assert.match(usage.errors.at(-1), /\nbeefy-slot perf: --ignore-load and --slots are not accepted; waive the load limit with `waive`$/);
+    assert.match(drive(["take", "--as", "a", "--wait", "soon"]).errors.at(-1), /\nbeefy-slot perf: --wait is for take, 0 to \d+ minutes$/);
+    assert.match(drive(["take", "--as", "a"], { env: { BEEFY_SLOT_PERF_HOST: "a b" } }).errors.at(-1), /^beefy-slot perf: the perf host "a b" is not a host name ssh would take$/);
   });
 
   it("builds the ssh command from a plain object too", () => {

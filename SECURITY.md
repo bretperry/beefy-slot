@@ -18,5 +18,4 @@ Only the latest release of `beefy-slot` gets fixes.
 
 ## Scope
 
-`beefy-slot` is open source under the MIT License (see `LICENSE`).
-Bugs in your own configuration, or in tools it runs on your behalf, are outside its scope.
+Scope: bugs in this tool's own code. Bugs in your configuration, or in programs it runs for you, are out of scope.

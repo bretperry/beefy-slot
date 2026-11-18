@@ -1,6 +1,6 @@
 /*
   Admission for CI jobs: a slot that lives while a worker process does, a reclaim that never takes a live
-  record, slot counts and the load gate set by the config, and records written by 0.1.0.
+  record, slot counts and the load limit set by the config, and records written by 0.1.0.
   Run with node --test; real child processes stand in for workers, and time is injected where it can be.
 */
 import "./tmpdir.mjs";
@@ -352,18 +352,18 @@ describe("a slot count from the config", () => {
   });
 });
 
-describe("a resource with no load gate", () => {
+describe("a resource with no load limit", () => {
   it("admits at any load, while heavy and a resource with a gate still wait", () => {
     const { run } = setup();
     const config = { resources: { ci: { slots: 3, loadGate: false }, gated: { slots: 3 } } };
     assert.equal(run(["take", "ci", "--as", "a"], { config, load: 400 }), 0);
-    assert.equal(run(["take", "heavy", "--as", "a"], { config, load: 400 }), BUSY, "heavy work keeps the load line");
+    assert.equal(run(["take", "heavy", "--as", "a"], { config, load: 400 }), BUSY, "heavy work keeps the load limit");
     assert.equal(run(["take", "gated", "--as", "a"], { config, load: 400 }), BUSY, "a gate is the default");
     assert.equal(run(["take", "perf", "--as", "a"], { config, load: 400 }), BUSY);
     assert.equal(run(["take", "ci", "--as", "b"], { config, load: 400 }), 0);
   });
 
-  it("a run inside the job, on heavy, still queues on the load line", () => {
+  it("a run inside the job, on heavy, still queues on the load limit", () => {
     const { run } = setup();
     const config = { resources: { ci: { loadGate: false } } };
     let inner;
@@ -395,7 +395,7 @@ describe("resources in beefy-slot.json", () => {
       [{ ci: { slots: "2" } }, /resources\.ci\.slots/],
       [{ ci: { loadGate: "no" } }, /resources\.ci\.loadGate: expected true or false/],
       [{ heavy: { slots: 2 } }, /resources\.heavy: heavy is reserved; its slots are set by heavySlots/],
-      [{ perf: {} }, /resources\.perf: perf is reserved; its load line is set by perfLoadMax/],
+      [{ perf: {} }, /resources\.perf: perf is reserved; its load limit is set by perfLoadMax/],
       [{ "bad name": {} }, /not a resource name/],
       [{ constructor: { slots: 0 } }, /resources\.constructor\.slots/],
     ]) assert.match(validate({ resources }), pattern, JSON.stringify(resources));

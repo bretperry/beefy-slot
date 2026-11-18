@@ -141,7 +141,7 @@ describe("lock slots", () => {
     assert.equal(holder(dir, "heavy"), null, "and the outer freed its own after");
   });
 
-  it("the guard still judges a command inside a run that holds the lock", () => {
+  it("the judge still judges a command inside a run that holds the lock", () => {
     const { dir, run } = setup();
     const env = { BEEFY_SLOT_LOCK_DIR: dir, BEEFY_SLOT_HEAVY_SLOTS: "1" };
     const real = new Date();
@@ -247,7 +247,7 @@ describe("lock queue", () => {
 });
 
 describe("lock waivers", () => {
-  it("lets a recorded waiver past the load line, and writes it into the lock it grants", () => {
+  it("lets a recorded waiver past the load limit, and writes it into the lock it grants", () => {
     const { dir } = setup();
     assert.equal(over(dir, "a").ok, false);
     assert.equal(waive({ dir, resource: "heavy", as: "a", reason: "owner OK: perf is idle", now: NOW }).ok, true);
@@ -271,7 +271,7 @@ describe("lock waivers", () => {
     assert.ok(activeWaiver(dir, "heavy", "a", NOW) && activeWaiver(dir, "heavy", "feat/b", NOW));
   });
 
-  it("never opens a full resource: only the load line is waived", () => {
+  it("never opens a full resource: only the load limit is waived", () => {
     const { dir } = setup();
     take({ dir, resource: "heavy", as: "a", now: NOW, load: 0 });
     waive({ dir, resource: "heavy", as: "b", reason: "r", now: NOW });
@@ -325,7 +325,7 @@ describe("lock: perf is reserved inside the lock", () => {
     assert.equal(run(["take", PERF, "--as", "a"], { env: PERF_ENV(dir), load: 1.4 }), 0);
   });
 
-  it("the load line for perf is not BEEFY_SLOT_LOAD_MAX", () => {
+  it("the load limit for perf is not BEEFY_SLOT_LOAD_MAX", () => {
     const { dir, run } = setup();
     assert.equal(run(["take", PERF, "--as", "a"], { env: PERF_ENV(dir, { BEEFY_SLOT_LOAD_MAX: "1000" }), load: 2 }), BUSY);
   });
@@ -615,5 +615,60 @@ describe("lock: many takers, few slots", () => {
     assert.equal(codes.filter((code) => code === BUSY).length, 6, `exit codes ${codes.join(",")}`);
     const holders = slotNames(HEAVY, 3).map((name) => holder(dir, name)?.as);
     assert.equal(new Set(holders).size, 3, `three different holders in three slots: ${holders.join(",")}`);
+  });
+});
+
+describe("lock messages", () => {
+  // A main with both streams captured.
+  const loud = () => {
+    const dir = mkdtempSync(join(tmpdir(), "lock-msg-"));
+    const errors = [];
+    const lines = [];
+    const run = (argv, env = {}) => main(argv, {
+      now: NOW, load: 0, judge: () => null, busiest: () => "", statusHeader: false,
+      out: (t) => lines.push(t), err: (t) => errors.push(t),
+      settings: resolveSettings({ env: { BEEFY_SLOT_LOCK_DIR: dir, ...env }, cores: 2 }),
+    });
+    return { run, errors, lines };
+  };
+
+  it("tells a taker of a one-holder resource who holds it, to try again, and how to queue", () => {
+    const { run, errors } = loud();
+    assert.equal(run(["take", "port-3000", "--as", "a"]), 0);
+    assert.equal(run(["take", "port-3000", "--as", "b"]), BUSY);
+    assert.match(errors.at(-1), /Try again later, or use --wait <minutes> to queue\./);
+    assert.equal(run(["take", "heavy", "--as", "a"], { BEEFY_SLOT_HEAVY_SLOTS: "1" }), 0);
+    assert.equal(run(["take", "heavy", "--as", "b"], { BEEFY_SLOT_HEAVY_SLOTS: "1" }), BUSY);
+    assert.match(errors.at(-1), /Try again later, or use --wait <minutes> to queue\./);
+  });
+
+  it("tells a taker of a full pool to try again or queue with --wait", () => {
+    const { run, errors } = loud();
+    const env = { BEEFY_SLOT_HEAVY_SLOTS: "2" };
+    assert.equal(run(["take", "heavy", "--as", "a"], env), 0);
+    assert.equal(run(["take", "heavy", "--as", "b"], env), 0);
+    assert.equal(run(["take", "heavy", "--as", "c"], env), BUSY);
+    assert.match(errors.at(-1), /all 2 heavy slots are held .*Try again later, or queue with --wait <minutes>\./);
+  });
+
+  it("tells a taker who asks for more slots than the holder took to use the same --slots", () => {
+    const { run, errors } = loud();
+    assert.equal(run(["take", "build", "--as", "a", "--slots", "1"]), 0);
+    assert.equal(run(["take", "build", "--as", "b", "--slots", "2"]), BUSY);
+    assert.match(errors.at(-1), /cannot share it\. Try again later, or use the same --slots\./);
+  });
+
+  it("asks for --as with an example name", () => {
+    const { run, errors } = loud();
+    assert.equal(run(["take", "build"]), 2);
+    assert.match(errors.at(-1), /--as <who> is required: a name for this job, such as my-build/);
+  });
+
+  it("calls the perf bound its own load limit, and a waiver the load limit", () => {
+    const { run, errors, lines } = loud();
+    assert.equal(run(["take", "perf", "--as", "a", "--slots", "2"]), 2);
+    assert.match(errors.at(-1), /perf is one holder with its own load limit; --slots and --ignore-load are not accepted\. Use `waive` to excuse the limit\./);
+    assert.equal(run(["waive", "heavy", "--as", "a", "--reason", "owner OK"]), 0);
+    assert.match(lines.at(-1), /^waived the load limit on heavy for a until /);
   });
 });

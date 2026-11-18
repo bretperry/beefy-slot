@@ -1,6 +1,6 @@
 # beefy-slot
 
-Queues heavy work on one machine, so parallel jobs take turns instead of piling on.
+Keeps heavy jobs on one machine from running all at once.
 
 ## Who it's for
 
@@ -61,7 +61,7 @@ beefy-slot 0.2.0 · folder ~/.beefy-slot/locks · judge none
 heavy: my-build until 2026-11-07T00:36:09.277Z
 ```
 
-`status` with nothing held prints `no locks held`.
+`status` with nothing held prints `no locks held`. The folder is printed as a full path.
 
 ## Commands
 
@@ -73,6 +73,7 @@ beefy-slot waive <resource> --as <who> --reason <why> [--ttl <min>]
 beefy-slot run <resource> [--as <who>] [--ttl <min>] [--slots <n>] [--wait <min>] [--ignore-load --reason <why>] -- <command...>
 beefy-slot perf take --as <who> [--wait <min>] [--ttl <min>] | free --as <who> | status | waive --as <who> --reason <why>
 beefy-slot --version
+beefy-slot --help
 ```
 
 - A resource name is up to 64 characters: letters, digits, `.`, `_`, `:`, `-`, starting with a letter or digit.
@@ -83,9 +84,9 @@ beefy-slot --version
   while its command lives; `--ttl` sets a hard end for the run.
 - `--wait` is minutes to queue, 0 to 240 (default 0). It polls every 20 seconds, so the order of
   waiters is not first come, first served.
-- Load gate: `take` and `run` refuse when the 1-minute load average is above the limit. The limit is
+- Load limit: `take` and `run` refuse when the 1-minute load average is above the limit. The limit is
   the larger of 3 and one per CPU core. The refusal names the busiest process.
-- `waive` excuses the load gate for one holder on one resource, 30 minutes by default and 120 at most.
+- `waive` excuses the load limit for one holder on one resource, 30 minutes by default and 120 at most.
   It never opens a full pool. `--ignore-load --reason <why>` does the same for one take. Both are
   logged in `waivers.log` in the lock folder.
 - `--worker <pid>` ties a `take` to a process: the slot lasts while that process does, not for `--ttl`.
@@ -93,14 +94,13 @@ beefy-slot --version
 - `perf` is a separate single-holder queue with its own, lower load limit, for runs that measure
   timings. It takes no `--slots` or `--ignore-load`. With `perfHost` set it runs on that host over `ssh`
   (needs `ssh` and `node` there).
-- `run` gives its command no stdin and sets `BEEFY_SLOT_LOCK_HELD` for it. A nested `beefy-slot run`
-  for a resource its parent already holds runs at once instead of waiting on itself.
-- `beefy-slot --help` prints the usage line and exits 2.
+- `run` gives its command no stdin and sets `BEEFY_SLOT_LOCK_HELD` for it. If a command started by `run` runs `beefy-slot run` on the same resource, the inner one starts at once.
+  It does not wait on its parent.
 
 ## Config
 
 Optional. Put a `beefy-slot.json` in your project. `beefy-slot` looks in the current folder, then
-each parent, and uses the first one it finds. A folder with `chute-boss.json` and no `beefy-slot.json` still counts (see Aliases). It stops at the first folder that holds `.git`.
+each parent, and uses the first one it finds. It stops at the first folder that holds `.git`.
 
 ```json
 {
@@ -159,9 +159,9 @@ the record's worker lives, and replaces the record once its worker is gone.
 call, and `--slots` is refused for it (exit 2). Raising the count takes effect on a busy machine: the
 next `take` uses the new count whatever count the current holders took it with.
 
-**No load gate.** `"loadGate": false` on a resource makes `take` and `run` admit at any load, so a
+**No load limit.** `"loadGate": false` on a resource makes `take` and `run` admit at any load, so a
 CI pool never waits on the load its own jobs make. A `heavy` take from inside a job keeps the load
-line.
+limit.
 
 ```json
 { "resources": { "ci": { "slots": 4, "loadGate": false } } }
@@ -172,7 +172,7 @@ Worker identity needs `/proc` on Linux, or `ps` and `sysctl` on macOS.
 ## Environment
 
 Environment variables win over the config file. A value that is not valid is ignored.
-The old `CHUTE_BOSS_` name of each variable still works; see Aliases.
+The old `CHUTE_BOSS_` name of each variable still works; see Upgrading from chute-boss.
 
 | Variable | Overrides | Default |
 |---|---|---|
@@ -185,23 +185,12 @@ The old `CHUTE_BOSS_` name of each variable still works; see Aliases.
 | `BEEFY_SLOT_LOCK_HEARTBEAT_SECONDS` | seconds between a `run`'s renewals | `30` |
 | `BEEFY_SLOT_LOCK_HELD` | set by `run` for its command; do not set it by hand | none |
 
-## Aliases
-
-Kept from the old `chute-boss` name for one release (0.1.x), so existing projects and machines keep working. They are removed in the next release:
-
-- Command: `chute-boss` runs the same program as `beefy-slot`.
-- Config file: `chute-boss.json`, read when the folder has no `beefy-slot.json`. `beefy-slot.json` wins when both exist.
-- Environment: every `BEEFY_SLOT_*` variable is also read under its `CHUTE_BOSS_*` name. The new name wins when both are set and valid.
-- `CHUTE_BOSS_LOCK_HELD` is set for a `run`'s command next to `BEEFY_SLOT_LOCK_HELD`, so nested runs see either.
-- Lock folder: the default is `~/.beefy-slot/locks`. A machine that has `~/.chute-boss/locks` and no `~/.beefy-slot/locks`
-  keeps using the old folder, so its slots do not split. Move it by renaming the folder, or set `lockDir`.
-
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
 | 0 | Done. |
-| 1 | Refused: someone else holds it, `free` by a non-holder, the judge stopped a `run`, or a `--worker` is not running. |
+| 1 | Refused: `free` by someone who is not the holder, the judge stopped a `run`, or a `--worker` is not running. |
 | 2 | Usage error or bad config. |
 | 75 | Busy: no free slot, or load above the limit. Try later. |
 
@@ -227,7 +216,7 @@ looks the same as a refusal, so check stderr when it matters.
 - macOS and Linux. Windows is not supported.
 - The lock folder must allow hard links. A lock is created by hard-linking a finished record into
   place, so it exists whole or not at all. On a file system without hard links (some network and
-  FAT-style mounts), `take` stops with `could not hard-link a lock in lockDir <folder>` and exits 1. The same error
+  FAT-style mounts), `take` stops with `could not create a lock in <folder>` and exits 1. The same error
   can mean you lack permission to write there. Set `lockDir` to a local disk.
 - Waiting is polling, not first come, first served. A waiter looks every 20 seconds (every 5 with
   `--worker`), so a later arrival can win a slot that freed between two looks.
@@ -240,10 +229,9 @@ looks the same as a refusal, so check stderr when it matters.
   it and exit 1.
 - Killing the `run` wrapper alone (SIGTERM or SIGKILL) frees the lock while its command may keep
   running. Stop the command too. A command killed by a signal makes `run` exit 128 plus the signal number.
-- Ctrl-C: the terminal stops `run` and its command together. `run` may not get to free its slot, but
-  the record names the `run` process. Once that process is gone, `status` shows the slot as free and
-  the next `take` reuses it. This holds on the same machine; a record is also good for only 2 minutes
-  after its last renewal. A plain `take` has no process to watch, so it lasts until `free` or its `--ttl`.
+- Ctrl-C stops `run` and its command. The slot may stay held for a moment, but once the `run` process
+  is gone, `status` shows it free and the next `take` reuses it. A record also expires 2 minutes after
+  its last renewal. A plain `take` has no process to watch, so it lasts until `free` or its `--ttl`.
 - A plain `take` without `run` holds the slot until `free` or its `--ttl` (60 minutes by default), even
   if your script dies. Prefer `run` for anything that can crash.
 - `free` reads the record, then deletes it, with no re-check in between. If the slot changes hands in
@@ -262,3 +250,10 @@ Report problems privately. See [SECURITY.md](SECURITY.md).
 ## Contributing
 
 Bug reports are welcome. Outside pull requests are not accepted yet. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Upgrading from chute-boss
+
+`chute-boss.json` and `CHUTE_BOSS_` variables still work through 0.2.x; the new name wins when both are set.
+
+- `run` sets `CHUTE_BOSS_LOCK_HELD` for its command next to `BEEFY_SLOT_LOCK_HELD`, so nested runs see either.
+- A machine that has `~/.chute-boss/locks` and no `~/.beefy-slot/locks` keeps using the old folder, so its slots do not split. Move it by renaming the folder, or set `lockDir`.
