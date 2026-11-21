@@ -1,9 +1,10 @@
 {
   "name": "beefy-slot",
-  "version": "0.2.1",
+  "version": "0.4.0",
   "type": "module",
   "bin": {
-    "beefy-slot": "bin/beefy-slot.mjs"
+    "beefy-slot": "bin/beefy-slot.mjs",
+    "beefy": "bin/beefy-slot.mjs"
   },
   "engines": {
     "node": ">=22"

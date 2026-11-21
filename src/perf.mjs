@@ -1,6 +1,6 @@
 // Queue for one quiet perf machine, waiting on the caller's side so a killed caller leaves no wait behind.
 // Used by: the package entry point and perf shim.
-// Exports: main, lockCommand (stdin transport), perfSettings, PERF_RESOURCE, PERF_LOAD_MAX.
+// Exports: main, lockCommand (stdin transport), perfSettings, HOST, PERF_RESOURCE, PERF_LOAD_MAX.
 // Uses: the self-contained lock core, ssh and node on a remote host.
 
 import { spawnSync } from "node:child_process";
@@ -18,7 +18,7 @@ const SSH_CONNECT_SECONDS = 10;
 const SSH_KEEPALIVE_SECONDS = 30;
 
 // A host as ssh takes it (a name, an alias, user@name): no leading dash, so it can't pass for an option.
-const HOST = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/;
+export const HOST = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$/;
 
 const VERBS = ["take", "free", "status", "waive"];
 const REFUSED_FLAGS = ["--ignore-load", "--slots"];

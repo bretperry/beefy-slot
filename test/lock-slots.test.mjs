@@ -485,7 +485,7 @@ describe("lock: a run keeps its slot for as long as it lives and not a minute af
     }
   });
 
-  it("a killed run frees its lock at once: the next taker gets it", async () => {
+  it("a killed run frees its lock once its command is stopped: the next taker gets it", async () => {
     const { dir } = setup();
     const env = { ...process.env, BEEFY_SLOT_LOCK_DIR: dir, BEEFY_SLOT_LOAD_MAX: "1000000", BEEFY_SLOT_LOCK_HEARTBEAT_SECONDS: "0.2" };
     const child = start(process.execPath, ["bin/beefy-slot.mjs", "run", "dead", "--as", "a", "--", process.execPath, "-e", "setTimeout(() => {}, 4000)"], { env, stdio: "ignore" });
@@ -498,7 +498,8 @@ describe("lock: a run keeps its slot for as long as it lives and not a minute af
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     }
-    assert.equal(take({ dir, resource: "dead", as: "b", now: new Date(), load: 0 }).ok, true, "a dead run does not hold the lock for an hour");
+    // The run's guard stops its command (a second or two), then frees the slot: the next taker gets it without waiting out the hour.
+    await waitFor(() => take({ dir, resource: "dead", as: "b", now: new Date(), load: 0 }).ok, "the dead run's lock to go to the next taker");
   });
 });
 
