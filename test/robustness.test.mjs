@@ -1,8 +1,8 @@
 // Wrong-shaped lock files, judge loading on bad config, unusable lockDir, spawn failures, signals.
 import "./tmpdir.mjs";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -62,5 +62,51 @@ describe("robustness", () => {
     assert.match(missing.stderr, /could not start no-such-program-beefy/);
     const killed = cli(dir, locks, ["run", "x", "--", process.execPath, "-e", "process.kill(process.pid, 'SIGTERM')"]);
     assert.equal(killed.status, 143, killed.stderr);
+  });
+
+  // A foreground `beefy <cmd>` that is killed outright (SIGKILL cannot be caught) leaves nothing that holds the line.
+  const pausedFor = async (check, ms = 8000) => {
+    const end = Date.now() + ms;
+    while (!check()) {
+      if (Date.now() > end) throw new Error("timed out");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  };
+  const background = (dir, locks, args) => spawn(process.execPath, [CLI, ...args], { cwd: dir, env: { ...process.env, BEEFY_SLOT_LOCK_DIR: locks, BEEFY_SLOT_LOAD_MAX: "1000000", BEEFY_SLOT_LOCK_POLL_SECONDS: "1", BEEFY_SLOT_LOCK_HEARTBEAT_SECONDS: "1" }, stdio: "ignore" });
+
+  it("a wrapper killed mid-wait frees its place in line", async () => {
+    const dir = fixture();
+    const locks = join(dir, "locks");
+    const pidFile = join(dir, "pid");
+    const holder = background(dir, locks, ["node", "-e", `require("fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000)`]);
+    await pausedFor(() => existsSync(pidFile) && readFileSync(pidFile, "utf8") !== "");
+    const waiter = background(dir, locks, ["node", "-e", "0"]);
+    try {
+      await pausedFor(() => /heavy: waiting/.test(cli(dir, locks, ["status"]).stdout));
+      waiter.kill("SIGKILL");
+      await pausedFor(() => !/heavy: waiting/.test(cli(dir, locks, ["status"]).stdout));
+    } finally {
+      holder.kill("SIGTERM");
+      waiter.kill("SIGKILL");
+    }
+  });
+
+  it("a wrapper killed mid-run frees the slot for the next job", async () => {
+    const dir = fixture();
+    const locks = join(dir, "locks");
+    const pidFile = join(dir, "pid");
+    const wrapper = background(dir, locks, ["node", "-e", `require("fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000)`]);
+    await pausedFor(() => existsSync(pidFile) && readFileSync(pidFile, "utf8") !== "");
+    const command = Number(readFileSync(pidFile, "utf8"));
+    try {
+      assert.doesNotMatch(cli(dir, locks, ["status"]).stdout, /no locks held/);
+      wrapper.kill("SIGKILL");
+      await pausedFor(() => /no locks held/.test(cli(dir, locks, ["status"]).stdout));
+      assert.equal(cli(dir, locks, ["node", "-e", "0"]).status, 0);
+    } finally {
+      try {
+        process.kill(command, "SIGKILL");
+      } catch {}
+    }
   });
 });

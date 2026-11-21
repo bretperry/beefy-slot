@@ -1,14 +1,20 @@
 // Programmatic entry point: route perf calls and supply the judge seam to the self-contained core.
 // Used by: the bin entry point and embedders.
-// Exports: main, resolveSettings, findConfig, validate, loadJudge, lock constants and helpers.
+// Exports: main, configMain, runTui, resolveSettings, findConfig, loadConfig, validate, checkConfig, loadJudge, lock constants and helpers.
 
 import { sep } from "node:path";
 import { USAGE, main as lockMain, resolveSettings } from "./beefy-slot.mjs";
 import { main as perfMain } from "./perf.mjs";
 import { sinkRefusal } from "./judge.mjs";
+import { jobsMain, startJob } from "./jobs.mjs";
 
 export * from "./beefy-slot.mjs";
-export { findConfig, validate } from "./config.mjs";
+export { findConfig, validate, loadConfig, machineConfigPath, readMachineConfig, writeMachineConfig, MACHINE_KEYS } from "./config.mjs";
+export { checkConfig, explain } from "./check.mjs";
+export { PRESETS, preset } from "./presets.mjs";
+export { configMain } from "./config-cli.mjs";
+export { runTui } from "./tui.mjs";
+export { jobsMain, startJob, listJobs, prune, JOB_RETENTION } from "./jobs.mjs";
 export { loadJudge, sinkRefusal, shellQuote, quoteCommand } from "./judge.mjs";
 
 // File system errors that mean lockDir is a file, missing a parent, or not accessible.
@@ -17,14 +23,14 @@ const DIR_ERRORS = ["ENOTDIR", "EEXIST", "EACCES", "EPERM", "EROFS", "ENOENT", "
 // True when the error's path is the lockDir, something inside it, or a parent on the way to it (its creation).
 const aboutLockDir = (error, dir) => typeof error?.path === "string" && (error.path === dir || error.path.startsWith(dir + sep) || dir.startsWith(error.path.endsWith(sep) ? error.path : error.path + sep));
 
-export const VERSION = "0.2.1";
+export const VERSION = "0.4.0";
 
 export const main = (argv, options = {}) => {
   if (argv[0] === "--version") {
     (options.out ?? console.log)(VERSION);
     return 0;
   }
-  if (argv[0] === "--help") {
+  if (argv[0] === "--help" || argv[0] === "-h" || argv[0] === "help") {
     (options.out ?? console.log)(USAGE);
     return 0;
   }
@@ -47,13 +53,17 @@ export const main = (argv, options = {}) => {
         return 1;
       }
       if (DIR_ERRORS.includes(error?.code) && aboutLockDir(error, settings.lockDir)) {
-        report(`beefy-slot: lockDir ${settings.lockDir} is not usable (${error.code}); it must be a folder you can read and write. Set lockDir in beefy-slot.json or BEEFY_SLOT_LOCK_DIR.`);
+        report(`beefy-slot: lockDir ${settings.lockDir} is not usable (${error.code}); it must be a folder you can read and write. Set lockDir in ~/.beefy-slot/config.json or BEEFY_SLOT_LOCK_DIR.`);
         return 1;
       }
       throw error;
     }
   };
   if (argv[0] === "perf") return guarded(() => perfMain(argv.slice(1), { ...options, settings }));
+  const refusal = (command) => sinkRefusal(command, options.judge);
+  // `-d` (the bin passes `detach`): record the job and start its wrapper. `job <id>` is that wrapper, which runs the job as a plain `run`.
+  if (options.detach && argv[0] === "run") return guarded(() => startJob({ argv, uncapped: options.uncapped, dir: settings.lockDir, refusal, out: options.out, err: options.err }));
+  if (["jobs", "log", "cancel", "job"].includes(argv[0])) return guarded(() => jobsMain(argv, { settings, run: (runArgv, extra) => lockMain(runArgv, { ...options, ...extra, settings, refusal }), out: options.out, err: options.err }));
   if (argv[0] === "status" && options.statusHeader !== false) (options.out ?? console.log)(`beefy-slot ${VERSION} · folder ${settings.lockDir} · judge ${options.judgePath ?? settings.config.judge ?? "none"}`);
-  return guarded(() => lockMain(argv, { ...options, settings, refusal: (command) => sinkRefusal(command, options.judge) }));
+  return guarded(() => lockMain(argv, { ...options, settings, refusal }));
 };

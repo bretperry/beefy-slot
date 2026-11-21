@@ -10,10 +10,11 @@
 
 import { spawn as spawnAsync, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, closeSync, existsSync, fstatSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, fstatSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { availableParallelism, constants as osConstants, homedir, loadavg } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 
 // Knobs: the load past which heavy work waits, and a lock's default life.
 // The limit is LOAD_MAX, or LOAD_PER_CORE per core when that is higher. Why per core: a flat 3 sat
@@ -76,6 +77,18 @@ const positive = (value) => {
 const text = (value) => typeof value === "string" && value.length > 0 ? value : null;
 const host = (value) => typeof value === "string" ? value : null;
 
+// The settings a variable can set: the key, its variable, the check a value must pass, and what it expects in words.
+// `config check` reads this to name a variable whose value is ignored.
+export const ENV_KNOBS = [
+  ["lockDir", "BEEFY_SLOT_LOCK_DIR", text, "a path"],
+  ["heavySlots", "BEEFY_SLOT_HEAVY_SLOTS", slotCount, `a whole number from 1 to ${MAX_SLOTS}`],
+  ["loadMax", "BEEFY_SLOT_LOAD_MAX", positive, "a positive number"],
+  ["perfLoadMax", "BEEFY_SLOT_PERF_LOAD_MAX", positive, "a positive number"],
+  ["perfHost", "BEEFY_SLOT_PERF_HOST", host, "a host name"],
+  ["pollSeconds", "BEEFY_SLOT_LOCK_POLL_SECONDS", positive, "a positive number of seconds"],
+  ["heartbeatSeconds", "BEEFY_SLOT_LOCK_HEARTBEAT_SECONDS", positive, "a positive number of seconds"],
+].map(([key, env, valid, expects]) => ({ key, env, valid, expects }));
+
 // The pre-rename name of a BEEFY_SLOT_ variable: CHUTE_BOSS_ is still read, so machines set up before the rename keep working.
 const legacyName = (name) => name.replace(/^BEEFY_SLOT_/, "CHUTE_BOSS_");
 
@@ -99,11 +112,11 @@ export const resolveSettings = ({ env = process.env, config = {}, envAliases = {
   return {
     lockDir: folder.startsWith("~/") ? join(home, folder.slice(2)) : folder,
     heavySlots: read("BEEFY_SLOT_HEAVY_SLOTS", slotCount, slotCount(config.heavySlots) ?? DEFAULT_HEAVY_SLOTS),
-    loadMax: read("BEEFY_SLOT_LOAD_MAX", positive, Math.max(LOAD_MAX, cores * LOAD_PER_CORE)),
+    loadMax: read("BEEFY_SLOT_LOAD_MAX", positive, positive(config.loadMax) ?? Math.max(LOAD_MAX, cores * LOAD_PER_CORE)),
     perfLoadMax: read("BEEFY_SLOT_PERF_LOAD_MAX", positive, positive(config.perfLoadMax) ?? PERF_LOAD_MAX),
     perfHost: read("BEEFY_SLOT_PERF_HOST", host, host(config.perfHost) ?? ""),
-    pollSeconds: read("BEEFY_SLOT_LOCK_POLL_SECONDS", positive, POLL_SECONDS),
-    heartbeatSeconds: read("BEEFY_SLOT_LOCK_HEARTBEAT_SECONDS", positive, HEARTBEAT_SECONDS),
+    pollSeconds: read("BEEFY_SLOT_LOCK_POLL_SECONDS", positive, positive(config.pollSeconds) ?? POLL_SECONDS),
+    heartbeatSeconds: read("BEEFY_SLOT_LOCK_HEARTBEAT_SECONDS", positive, positive(config.heartbeatSeconds) ?? HEARTBEAT_SECONDS),
     resources: resourceSettings(config.resources),
     held, heldNames, childEnv: { ...env }, config: { ...config }, envAliases,
   };
@@ -158,7 +171,7 @@ export const busiestProcess = () => {
 };
 
 // A resource name becomes a file name, so it stays to a safe alphabet.
-const RESOURCE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+export const RESOURCE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 const safeName = (resource) => resource.replace(/:/g, "_");
 const fileOf = (dir, resource) => join(dir, `${safeName(resource)}.json`);
 
@@ -261,12 +274,13 @@ export const workerAlive = (worker, probe) => workerState(worker, probe) === "al
 
 const sameWorker = (a, b) => (!a && !b) || Boolean(a && b && a.pid === b.pid && a.start === b.start && a.boot === b.boot);
 
-// A record is stale when it names a run (`watch`) whose process is gone, when its `cap` (the end a --ttl set) has passed,
+// A record is stale when it names a run (`watch`) whose process is gone (and no guard is stopping its command), when its `cap` (the end a --ttl set) has passed,
 // or when it names a `worker`: dead means stale, alive means live whatever its time says (the slot lives while the
 // process does), and unknown (the look failed) falls back to the time. Without a worker, a record is stale when its time is up.
 const stale = (held, now, probe) => {
   if (!held) return true;
-  if (typeof held.watch === "number" && !alive(held.watch)) return true;
+  // A run whose wrapper is gone still holds the slot while its guard is stopping the command (`group`): the guard frees it.
+  if (typeof held.watch === "number" && !alive(held.watch) && !(typeof held.guard === "number" && held.group && alive(held.guard))) return true;
   if (held.worker !== undefined) {
     if (typeof held.cap === "string" && Date.parse(held.cap) <= now.getTime()) return true;
     const state = workerState(held.worker, probe);
@@ -283,7 +297,7 @@ const GUARD_STALE_MS = 10_000;
 const NO_LINKS = ["EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EXDEV", "EMLINK"];
 export const linkFailure = (error, path) => {
   if (!NO_LINKS.includes(error?.code)) return error;
-  return Object.assign(new Error(`beefy-slot: could not create a lock in ${dirname(path)} (${error.code}): this folder may not support hard links, or you may not be allowed to write there. Set lockDir in beefy-slot.json or BEEFY_SLOT_LOCK_DIR to a local folder you can write to.`), { code: "ENOHARDLINK", cause: error });
+  return Object.assign(new Error(`beefy-slot: could not create a lock in ${dirname(path)} (${error.code}): this folder may not support hard links, or you may not be allowed to write there. Set lockDir in ~/.beefy-slot/config.json or BEEFY_SLOT_LOCK_DIR to a local folder you can write to.`), { code: "ENOHARDLINK", cause: error });
 };
 
 // Creates the lock file with its whole record or not at all: written aside, then hard-linked into
@@ -442,31 +456,227 @@ const takeSlots = ({ dir, resource, as, id, slots = 1, fixed = false, worker, lo
   return { ok: false, reason: `all ${cap} ${resource} slots are held (${live.map((held) => `${held.as} until ${held.until}`).join(", ")}). Try again later, or queue with --wait <minutes>.` };
 };
 
+// The live holders of a resource, across every slot name: [{ slot, ...record }].
+export const liveHolders = (dir, resource, now = new Date(), probe) => slotNames(resource, MAX_SLOTS).map((name) => [name, holder(dir, name)]).filter(([, held]) => held && !stale(held, now, probe)).map(([slot, held]) => ({ slot, ...held }));
+
+// Tickets: a waiting take's place in line, one file each in `tickets/` under the lock folder, so the
+// first to wait is the first served. A ticket is live while its waiter's process is and its lease has
+// not run out; the waiter renews the lease at every look. Why a lease as well as the process: a waiter
+// that is stopped but not dead (Ctrl-Z) would hold the line for good. Why 60 s at least: a few slow
+// looks on a loaded machine must not lose a place.
+const TICKETS = "tickets";
+export const TICKET_LEASE_SECONDS = 60;
+const ticketFile = (dir, resource, id) => join(dir, TICKETS, `${safeName(resource)}~${id}.json`);
+
+// Every live ticket in the folder, first come first. `sweep` removes the dead ones it meets (a take does; status only reads).
+const tickets = (dir, now, sweep = false) => {
+  const folder = join(dir, TICKETS);
+  let names;
+  try {
+    names = readdirSync(folder);
+  } catch {
+    return [];
+  }
+  const live = [];
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    let ticket = null;
+    try {
+      ticket = JSON.parse(readFileSync(join(folder, name), "utf8"));
+    } catch {}
+    const valid = ticket && typeof ticket === "object" && typeof ticket.resource === "string" && typeof ticket.as === "string" && typeof ticket.id === "string" && typeof ticket.at === "string" && Number.isFinite(Date.parse(ticket.until));
+    if (valid && Date.parse(ticket.until) > now.getTime() && (typeof ticket.pid !== "number" || alive(ticket.pid))) live.push(ticket);
+    else if (sweep) rmSync(join(folder, name), { force: true });
+  }
+  return live.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : a.id < b.id ? -1 : 1));
+};
+
+// The takes waiting for a resource, first come first: [{ resource, as, id, at, until, pid, yield? }].
+export const waiting = (dir, resource, now = new Date()) => tickets(dir, now).filter((ticket) => ticket.resource === resource);
+
+// What the lock folder holds, for `status --json` and the config screen: the load, and for `heavy`, `perf`,
+// each configured resource and any other with a holder or a waiter, its count, holders, waiters and waivers.
+export const snapshot = ({ dir, settings, now = new Date(), probe, load = loadavg()[0], only }) => {
+  const files = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".json")).map((f) => f.slice(0, -5)) : [];
+  const records = files.map((name) => holder(dir, name)).filter((held) => held && !stale(held, now, probe));
+  const base = (held) => (typeof held.resource === "string" ? held.resource.split("~")[0] : "");
+  const line = tickets(dir, now);
+  const names = new Set([HEAVY, PERF, ...Object.keys(settings.resources ?? {})]);
+  for (const held of records) if (base(held)) names.add(base(held));
+  for (const ticket of line) names.add(ticket.resource);
+  const resources = [...names].filter((name) => only === undefined || name === only).map((name) => ({
+    name,
+    slots: slotsFor(name, settings),
+    loadMax: name === PERF ? perfLoadLine(settings) : loadGated(name, settings) ? loadLine(settings) : null,
+    holders: records.filter((held) => !held.reason && base(held) === name).map((held) => ({ slot: held.resource, as: held.as, at: held.at, until: held.until, ...(held.worker ? { worker: held.worker.pid } : {}), ...(held.waived ? { waived: held.waived.reason } : {}) })),
+    waiting: line.filter((ticket) => ticket.resource === name).map((ticket) => ({ as: ticket.as, at: ticket.at, ...(ticket.yield ? { yield: true } : {}) })),
+    waivers: records.filter((held) => held.reason && held.resource === name).map((held) => ({ as: held.as, reason: held.reason, until: held.until })),
+  }));
+  return { load, lockDir: dir, resources };
+};
+
+// A free says so by creating and removing `<resource>.wake` (the folder is left as it was). macOS does not report the removal of a lock file made with a hard link (the
+// way `create` makes one), so without this a watcher would hear nothing when a slot frees. A plain create is reported
+// on macOS and Linux alike. Only the waiters for this resource look at it; a failed write costs them one poll.
+const wake = (dir, resource) => {
+  try {
+    const path = join(dir, `${safeName(resource)}.wake`);
+    writeFileSync(path, `${Date.now()}\n`);
+    rmSync(path, { force: true });
+  } catch {}
+};
+
 // Blocks the thread for `ms` (the queue's wait has nothing else to do).
 const pause = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+// Wakes a waiting take the moment the lock folder or `tickets/` changes, so a freed slot is looked at
+// at once, not at the next poll. `take` is sync and its wait blocks the thread, which would deafen
+// fs.watch here, so a worker thread watches and bumps a shared counter the blocked thread waits on:
+// { seen(), wait(ms, seen), close() }, or null when it could not start (the poll serves alone).
+// The counter is read before each look and the wait names that reading, so a change that lands
+// between the look and the wait ends the wait at once: no wake is lost in that gap.
+// Only names for `resource` count (its slot files, waivers, tickets), so other resources' traffic
+// wakes nobody; no marker file is needed. A change the watcher never reports costs one poll.
+const WATCHER = `
+const { workerData: { sab, dir, tickets, prefix, ticketPrefix } } = require("node:worker_threads");
+const fs = require("node:fs");
+const flags = new Int32Array(sab);
+const bump = () => { Atomics.add(flags, 0, 1); Atomics.notify(flags, 0); };
+// A look writes and removes its own aside files (.tmp) and a takeover guard; hearing those would wake the waiter at itself.
+const mine = (text) => text.endsWith(".tmp") || text.endsWith(".takeover");
+let sub = null;
+const watchTickets = () => {
+  try { sub?.close(); } catch {}
+  sub = null;
+  try {
+    sub = fs.watch(tickets, (_, name) => { const text = name ? String(name) : ""; if (!text || (text.startsWith(ticketPrefix) && !mine(text))) bump(); });
+    sub.on("error", () => { sub = null; });
+  } catch {}
+};
+try {
+  const root = fs.watch(dir, (_, name) => {
+    const text = name === null || name === undefined ? "" : String(name);
+    if (text === "tickets") { watchTickets(); bump(); } else if (!text || (text.startsWith(prefix) && !mine(text))) bump();
+  });
+  root.on("error", () => {});
+  watchTickets();
+  Atomics.store(flags, 1, 1); Atomics.notify(flags, 1);
+} catch {
+  Atomics.store(flags, 1, 2); Atomics.notify(flags, 1);
+}
+`;
+// execArgv is empty so the worker is plain CommonJS even when the process runs with --input-type=module.
+const WATCH_READY_MS = 1000;
+const watchFor = (dir, resource) => {
+  try {
+    const sab = new SharedArrayBuffer(8);
+    const flags = new Int32Array(sab);
+    const prefix = safeName(resource);
+    const thread = new Worker(WATCHER, { eval: true, execArgv: [], workerData: { sab, dir, tickets: join(dir, TICKETS), prefix, ticketPrefix: `${prefix}~` } });
+    thread.on("error", () => Atomics.store(flags, 1, 2));
+    thread.unref();
+    // Ready once the folder is watched; a watch that never starts leaves the poll to do the work.
+    if (Atomics.load(flags, 1) === 0) Atomics.wait(flags, 1, 0, WATCH_READY_MS);
+    if (Atomics.load(flags, 1) !== 1) {
+      void thread.terminate();
+      return null;
+    }
+    return {
+      seen: () => Atomics.load(flags, 0),
+      wait: (ms, seen) => Atomics.wait(flags, 0, seen, ms),
+      close: () => void thread.terminate(),
+    };
+  } catch {
+    return null;
+  }
+};
 
 // Takes a slot, or says who has them: { ok: true } | { ok: false, reason }. `wait` minutes of queueing
 // (0 to MAX_WAIT_MINUTES): look again every `pollSeconds` until a slot is free and the load is under the
 // line, or the minutes run out (then the last refusal comes back). `slots` is how many holders the
 // resource admits. Time is read from `clock` when one is given (the real clock for the CLI), else counted
 // from `now` plus the sleeps. With a `worker` the wait looks at it every WORKER_CHECK_SECONDS at most and
-// gives up with { ok: false, gone: true } once it is gone. `onStale`, `sleep`, `reload` (a fresh load
+// gives up with { ok: false, gone: true } once it is gone. Without a `sleep`, a watcher (`waker`) wakes the wait
+// when the lock folder changes, with the poll as the fallback. `onStale`, `sleep`, `waker`, `reload` (a fresh load
 // reading for each look after the first), `clock` and `alive` (the worker check) and `probe` (a look at a worker's process) are test seams.
-export const take = ({ wait = 0, pollSeconds = POLL_SECONDS, sleep = pause, reload = () => loadavg()[0], clock, now = new Date(), load = loadavg()[0], alive: workerUp, probe, ...rest }) => {
-  if (!Number.isFinite(wait) || wait < 0 || wait > MAX_WAIT_MINUTES) return { ok: false, reason: `a wait is 0 to ${MAX_WAIT_MINUTES} minutes, not ${wait}` };
-  const limit = wait * 60_000;
+export const take = ({ wait = 0, uncapped = false, onWait, pollSeconds = POLL_SECONDS, sleep, waker = watchFor, reload = () => loadavg()[0], clock, now = new Date(), load = loadavg()[0], alive: workerUp, probe, ...rest }) => {
+  if (!uncapped && (!Number.isFinite(wait) || wait < 0 || wait > MAX_WAIT_MINUTES)) return { ok: false, reason: `a wait is 0 to ${MAX_WAIT_MINUTES} minutes, not ${wait}` };
+  const limit = uncapped ? Number.POSITIVE_INFINITY : wait * 60_000;
   // The worker is gone only when it is known to be; a look that failed says nothing, and the wait goes on.
   const gone = workerUp ? (worker) => !workerUp(worker) : (worker) => workerState(worker, probe) === "dead";
   const start = (clock ? clock() : now).getTime();
   const look = (rest.worker ? Math.min(pollSeconds, WORKER_CHECK_SECONDS) : pollSeconds) * 1000;
+  const { dir, resource, as } = rest;
+  const slots = rest.slots ?? 1;
+  // This take's place in line, written at its first refusal and removed when it ends, however it ends.
+  const ticket = { id: randomUUID(), at: "", yield: false };
+  const lease = Math.max(TICKET_LEASE_SECONDS * 1000, look * 3);
+  const punch = (at) => {
+    mkdirSync(join(dir, TICKETS), { recursive: true });
+    replace(ticketFile(dir, resource, ticket.id), JSON.stringify({ resource, as, id: ticket.id, at: ticket.at, until: new Date(at.getTime() + lease).toISOString(), pid: process.pid, ...(ticket.yield ? { yield: true } : {}) }));
+  };
+  // With no `sleep` given, the wait is the real one: a watcher wakes it early when the lock folder changes.
+  const nap = sleep ?? pause;
+  const realStart = Date.now();
+  let watcher = null;
+  let lastPunch = 0;
   let waited = 0;
-  for (;;) {
-    if (rest.worker && gone(rest.worker)) return { ok: false, gone: true, reason: `worker ${rest.worker.pid} is gone${waited > 0 ? ` (waited ${Math.round(waited / 60_000)} min)` : ""}; no slot is taken for it` };
-    const result = takeSlots({ ...rest, probe, now: clock ? clock() : new Date(start + waited), load: waited === 0 ? load : reload() });
-    if (result.ok || waited >= limit) return waited === 0 ? result : { ...result, reason: `${result.reason} (waited ${Math.round(waited / 60_000)} min)` };
-    const step = Math.min(look, limit - waited);
-    sleep(step);
-    waited = clock ? Math.max(clock().getTime() - start, waited + 1) : waited + step;
+  try {
+    for (;;) {
+      // Read before the look, so a change that lands during it ends the wait below at once.
+      const seen = watcher ? watcher.seen() : 0;
+      if (rest.worker && gone(rest.worker)) return { ok: false, gone: true, reason: `worker ${rest.worker.pid} is gone${waited > 0 ? ` (waited ${Math.round(waited / 60_000)} min)` : ""}; no slot is taken for it` };
+      const at = clock ? clock() : new Date(start + waited);
+      // First come, first served: with others in line, this take goes only when the open slots reach its place.
+      // A waiter that had a slot open to it and still could not take (the load, a `--slots` that cannot share)
+      // steps aside (`yield`) so the ones behind are not held up by it. A take that already holds a slot is a refresh, not in line.
+      const line = tickets(dir, at, true).filter((other) => other.resource === resource && other.id !== ticket.id);
+      const ahead = line.filter((other) => !other.yield && (ticket.at === "" || other.at < ticket.at || (other.at === ticket.at && other.id < ticket.id))).length;
+      const open = () => slots - liveHolders(dir, resource, at, probe).length;
+      const turn = ahead === 0 || ahead < open() || slotNames(resource, MAX_SLOTS).some((name) => ownedBy(holder(dir, name), as, rest.id, rest.worker));
+      const result = turn
+        ? takeSlots({ ...rest, probe, now: at, load: waited === 0 ? load : reload() })
+        : { ok: false, reason: `${ahead} earlier take${ahead === 1 ? " is" : "s are"} waiting for ${resource}. Try again later, or use --wait <minutes> to queue.` };
+      if (result.ok || waited >= limit) return waited === 0 ? result : { ...result, reason: `${result.reason} (waited ${Math.round(waited / 60_000)} min)` };
+      if (ticket.at === "") ticket.at = at.toISOString();
+      const yielded = turn && open() > 0;
+      onWait?.({ ahead, reason: result.reason });
+      // The place is renewed once a poll interval, not at every wake: a renewal is a change in `tickets/`, and
+      // every waiter's wake would set off the next one's.
+      if (lastPunch === 0 || yielded !== ticket.yield || at.getTime() - lastPunch >= look) {
+        ticket.yield = yielded;
+        punch(at);
+        lastPunch = at.getTime();
+      }
+      const step = Math.min(look, limit - waited);
+      if (sleep) {
+        sleep(step);
+        waited = clock ? Math.max(clock().getTime() - start, waited + 1) : waited + step;
+      } else {
+        if (watcher === null) {
+          // The watcher starts after the first look, so look again at once: a change in between was not heard.
+          // BEEFY_SLOT_WATCH=off keeps the wait at poll speed (a folder whose changes are never reported).
+          try {
+            watcher = waker === watchFor && process.env.BEEFY_SLOT_WATCH === "off" ? false : waker(dir, resource) ?? false;
+          } catch {
+            watcher = false;
+          }
+          if (watcher) continue;
+        }
+        if (watcher) watcher.wait(step, seen);
+        else nap(step);
+        waited = Math.max(Date.now() - realStart, waited + 1);
+      }
+    }
+  } finally {
+    if (watcher) watcher.close();
+    if (ticket.at !== "") {
+      rmSync(ticketFile(dir, resource, ticket.id), { force: true });
+      // The folder goes with its last ticket; a failure means someone else is still in line.
+      try {
+        rmdirSync(join(dir, TICKETS));
+      } catch {}
+    }
   }
 };
 
@@ -487,6 +697,7 @@ export const free = ({ dir, resource, as, id, now = new Date(), probe }) => {
     } else if (!stale(held, now, probe)) other ??= held;
   }
   if (!mine && other) return { ok: false, reason: `${resource} is held by ${other.as}, not ${as}; only its holder frees it` };
+  if (mine) wake(dir, resource);
   return { ok: true };
 };
 
@@ -513,7 +724,7 @@ export const heldBy = ({ dir, resource, settings, now = new Date(), probe }) => 
   });
 };
 
-export const USAGE = "usage: beefy-slot <command> …\n  take <resource> --as <who> [--ttl <minutes>] [--slots <n>] [--wait <minutes>] [--worker <pid>] [--ignore-load --reason <why>]\n  free <resource> --as <who>\n  status [<resource>]\n  waive <resource> --as <who> --reason <why> [--ttl <minutes>]\n  run <resource> [--as <who>] [--ttl <minutes>] [--slots <n>] [--wait <minutes>] [--ignore-load --reason <why>] -- <command…>\n  perf take --as <who> [--wait <minutes>] [--ttl <minutes>] | free --as <who> | status | waive --as <who> --reason <why>\n  --version";
+export const USAGE = "usage: beefy-slot <command> …\n  beefy [-d] [--on <resource>] [--wait <minutes>] [--as <who>] [--] <command…>   queue, then run it; -d runs it in the background and prints a job id\n  beefy   (alone, on a terminal) opens the queue screen\n  jobs [--json]\n  log <id> [-f]\n  cancel <id>\n  take <resource> --as <who> [--ttl <minutes>] [--slots <n>] [--wait <minutes>] [--worker <pid>] [--ignore-load --reason <why>]\n  free <resource> --as <who>\n  status [<resource>] [--json]\n  waive <resource> --as <who> --reason <why> [--ttl <minutes>]\n  run <resource> [--as <who>] [--ttl <minutes>] [--slots <n>] [--wait <minutes>] [--ignore-load --reason <why>] -- <command…>\n  perf take --as <who> [--wait <minutes>] [--ttl <minutes>] | free --as <who> | status | waive --as <who> --reason <why>\n  config [check [--strict] | show | preset <name> [--write]]\n  -- <command…>   run a command even when its name is a verb\n  --version";
 
 // Flags before `--`, and the command after it. `error` is a flag that is recognised but out of range.
 const parse = (args) => {
@@ -540,6 +751,8 @@ const parse = (args) => {
     else if (own[i] === "--dir" && own[i + 1]) opts.dir = own[++i];
     else if (own[i] === "--every" && positive(own[i + 1])) opts.every = positive(own[++i]);
     else if (own[i] === "--ignore-load") opts.ignoreLoad = true;
+    else if (own[i] === "--guard") opts.guard = true;
+    else if (own[i] === "--json") opts.json = true;
     else if (own[i].startsWith("--")) return null;
     else opts.rest.push(own[i]);
   }
@@ -547,16 +760,73 @@ const parse = (args) => {
 };
 
 // Starts the process that renews a lock while its run (this process) or its `worker` lives; null when it can't start.
-const startKeeper = ({ resource, id, until, dir, every, worker }, env) => {
+// With `guard` it also looks every second, and when the run is gone it stops the run's command (see `stopGroup`) and then frees the slot.
+const startKeeper = ({ resource, id, until, dir, every, worker, guard }, env) => {
   try {
     const watched = worker ? ["--pid", String(worker.pid), "--start", worker.start, "--boot", worker.boot] : ["--pid", String(process.pid)];
-    const child = spawnAsync(process.execPath, [fileURLToPath(import.meta.url), "keep", resource, "--id", id, ...watched, "--dir", dir, "--every", String(every), ...(until ? ["--until", until] : [])], { detached: true, stdio: "ignore", env });
+    const child = spawnAsync(process.execPath, [fileURLToPath(import.meta.url), "keep", resource, "--id", id, ...watched, "--dir", dir, "--every", String(every), ...(until ? ["--until", until] : []), ...(guard ? ["--guard"] : [])], { detached: true, stdio: "ignore", env });
     child.on("error", () => {});
     child.unref();
     return child.pid === undefined ? null : child;
   } catch {
     return null;
   }
+};
+
+// How long a guard waits for a command to leave after SIGTERM before it sends SIGKILL; how often it looks at the run.
+export const GROUP_GRACE_SECONDS = 10;
+const GUARD_TICK_MS = 1000;
+
+// The pids below `pid` in the process tree (children, their children…), from one `ps` look; [] when ps fails.
+const descendants = (pid) => {
+  const ps = spawnSync("ps", ["-A", "-o", "pid=,ppid="], { encoding: "utf8", timeout: 2000 });
+  if (ps.status !== 0 || typeof ps.stdout !== "string") return [];
+  const kids = new Map();
+  for (const line of ps.stdout.split("\n")) {
+    const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+    if (match) kids.set(Number(match[2]), [...(kids.get(Number(match[2])) ?? []), Number(match[1])]);
+  }
+  const found = [];
+  const queue = [pid];
+  while (queue.length > 0) {
+    for (const kid of kids.get(queue.shift()) ?? []) {
+      found.push(kid);
+      queue.push(kid);
+    }
+  }
+  return found;
+};
+
+// A command's group: { pid, tree: false } is a process group of its own (pgid = pid: signal -pid); { pid, tree: true } is a command that
+// shares its parent's group (on a terminal, so it stays in the foreground), reached through the process tree below it, never the whole group.
+const signalGroup = (group, signal) => {
+  const targets = group.tree ? [group.pid, ...descendants(group.pid)] : [-group.pid];
+  for (const target of targets) {
+    try {
+      process.kill(target, signal);
+    } catch {}
+  }
+  return targets;
+};
+
+// Whether the command a record names is still the process it was: its pid and start time still match (the pid alone when the record
+// has no start time). A pid is reused, and a stale record must never send a signal to an unrelated process or group.
+const groupIsOurs = (group, probe) => (typeof group.start === "string" && group.start !== "" && typeof group.boot === "string" ? workerState({ pid: group.pid, start: group.start, boot: group.boot }, probe) !== "dead" : alive(group.pid));
+
+// TERM, then KILL after the grace, until nothing of the group is left (or the KILL has had 5 s): { gone }. Nothing is signalled
+// when the command's identity no longer matches (it exited and its pid went to something else): { gone: true, skipped: true }.
+// The KILL goes only to a group still there at the last look, so it follows this stop's own TERM.
+export const stopGroup = (group, sleep, graceMs = GROUP_GRACE_SECONDS * 1000, probe) => {
+  if (!groupIsOurs(group, probe)) return { gone: true, skipped: true };
+  const members = new Set(signalGroup(group, "SIGTERM"));
+  const up = () => (group.tree ? [...members].some((pid) => alive(pid)) : alive(-group.pid));
+  for (let waited = 0; up() && waited < graceMs; waited += 100) sleep(100);
+  if (up()) {
+    if (group.tree) for (const pid of signalGroup(group, "SIGKILL")) members.add(pid);
+    else signalGroup(group, "SIGKILL");
+    for (let waited = 0; up() && waited < 5000; waited += 100) sleep(100);
+  }
+  return { gone: !up() };
 };
 
 // Whether text is being fed to this process (a pipe, a heredoc, `<` a file, /dev/stdin): the command gets none of it.
@@ -569,34 +839,109 @@ const stdinFed = () => {
   }
 };
 
-// Runs the command with stdin closed, not inherited, whether it is a terminal, pipe, or file, and a keeper renewing `keep`'s lock meanwhile (stopped before this returns).
-const defaultSpawn = (command, { env, keep }) => {
-  const keeper = keep ? startKeeper(keep, env) : null;
-  try {
-    const result = spawnSync(command[0], command.slice(1), { stdio: ["ignore", "inherit", "inherit"], env, shell: process.platform === "win32" });
-    if (result.error) {
-      console.error(`beefy-slot: could not start ${command[0]}: ${result.error.message}`);
-      return 1;
-    }
-    if (result.signal) return 128 + (osConstants.signals[result.signal] ?? 0);
-    return result.status ?? 1;
-  } finally {
-    keeper?.kill();
+// Signals a wrapper passes on to its command instead of dying of them (a SIGKILL cannot be caught).
+const FORWARDED = ["SIGTERM", "SIGINT", "SIGHUP"];
+
+// Runs the command with stdin closed, not inherited, whether it is a terminal, pipe, or file, and a guard keeper renewing `keep`'s lock meanwhile
+// (stopped before this settles). Resolves to the exit code. This process is the lease, so it lives until the command is gone: SIGTERM, SIGINT and
+// SIGHUP sent to it go on to the command and its children (a kill of the wrapper must not free the slot and leave the command running).
+// Off a terminal the command gets a process group of its own and the signals go to that group. On a terminal it stays in this process's group,
+// so it is in the foreground (a tty prompt works, Ctrl-C and Ctrl-Z reach it as they would the plain command); there SIGTERM and SIGHUP go to the
+// command and the processes below it, and SIGINT is left to the terminal, which has already sent it. The record names the command's group, so
+// if this process is killed outright (SIGKILL) its guard stops the command before the slot frees. `onChild({ pid })` is told once the command exists.
+const defaultSpawn = (command, { env, keep, onChild }) => new Promise((resolve) => {
+  const posix = process.platform !== "win32";
+  const shared = posix && Boolean(process.stdin.isTTY || process.stdout.isTTY || process.stderr.isTTY);
+  const handlers = [];
+  let child;
+  let keeper = null;
+  // The handlers go in before anything is spawned: a signal in the middle of the spawn must not meet the default action and leave a command behind.
+  // One that arrives before the command exists is kept and applied as soon as it does.
+  const pending = [];
+  const forward = (signal) => {
+    if (shared && signal === "SIGINT") return;
+    try {
+      if (posix) signalGroup({ pid: child.pid, tree: shared }, signal);
+      else child.kill(signal);
+    } catch {}
+  };
+  for (const signal of FORWARDED) {
+    const handler = () => (child?.pid === undefined ? pending.push(signal) : forward(signal));
+    process.on(signal, handler);
+    handlers.push([signal, handler]);
   }
+  const settle = (code) => {
+    for (const [signal, handler] of handlers) process.off(signal, handler);
+    keeper?.kill();
+    resolve(code);
+  };
+  const fail = (error) => {
+    console.error(`beefy-slot: could not start ${command[0]}: ${error.message}`);
+    settle(1);
+  };
+  keeper = keep ? startKeeper({ ...keep, guard: true }, env) : null;
+  try {
+    child = spawnAsync(command[0], command.slice(1), { stdio: ["ignore", "inherit", "inherit"], env, shell: !posix, detached: posix && !shared });
+  } catch (error) {
+    fail(error);
+    return;
+  }
+  child.once("error", fail);
+  child.once("exit", (code, signal) => settle(signal ? 128 + (osConstants.signals[signal] ?? 0) : code ?? 1));
+  if (child.pid === undefined) return;
+  // The record names the command's group and its guard, so a wrapper killed from now on leaves a guard that stops the command with the slot
+  // still held. The pid is only known once the command exists, so this cannot come before the spawn; the window is the few instructions between.
+  const record = (extra) => keep && refreshHolder({ dir: keep.dir, resource: keep.resource, id: keep.id, extra: { ...extra, ...(keeper ? { guard: keeper.pid } : {}) } });
+  record({ group: { pid: child.pid, tree: shared } });
+  for (const signal of pending.splice(0)) forward(signal);
+  // Then its identity (one `ps` look), which the guard checks before it signals anything: a pid can be reused.
+  const identity = workerIdentity(child.pid);
+  if (identity) record({ group: { pid: child.pid, tree: shared, start: identity.start, boot: identity.boot } });
+  onChild?.({ pid: child.pid, identity });
+});
+
+// Words that are verbs, not commands; `keep` and `job` are internal (a lock's renewer, a detached job's wrapper).
+const VERBS = ["take", "free", "run", "status", "waive", "perf", "config", "log", "jobs", "cancel", "help", "keep", "job"];
+
+// `beefy [--on <resource>] [--wait <min>] [--as <who>] [--] <cmd…>`: a first word that is not a verb (or a `--` first) is a command.
+export const isCommand = (argv) => argv.length > 0 && !VERBS.includes(argv[0]) && !["--version", "--help", "-h"].includes(argv[0]);
+
+// The `run` argv for a command, whether it queues with no cap (no --wait given; pass it to `main` as `uncapped`), and whether `-d`
+// asked for a detached job; null when a flag is not one of the four.
+export const commandArgv = (argv) => {
+  let on = HEAVY;
+  let detach = false;
+  const flags = [];
+  let i = 0;
+  while (i < argv.length && argv[i] !== "--" && (argv[i].startsWith("--") || argv[i] === "-d")) {
+    if (argv[i] === "-d") {
+      detach = true;
+      i += 1;
+      continue;
+    }
+    if (!["--on", "--wait", "--as"].includes(argv[i]) || argv[i + 1] === undefined || argv[i + 1].startsWith("--")) return null;
+    if (argv[i] === "--on") on = argv[i + 1];
+    else flags.push(argv[i], argv[i + 1]);
+    i += 2;
+  }
+  const command = argv.slice(argv[i] === "--" ? i + 1 : i);
+  return command.length === 0 ? null : { argv: ["run", on, ...flags, "--", ...command], uncapped: !flags.includes("--wait"), detach };
 };
 
 /** @returns {string | null} */
 const defaultRefusal = () => "no judge was loaded";
 
-// Returns the exit code: 0 done, 75 busy, 1 refused (also a command the judge stops), 2 usage; `run` returns its command's code.
-export const main = (argv, { settings, now: nowGiven, load = loadavg()[0], busiest = busiestProcess, spawn = defaultSpawn, refusal = defaultRefusal, out = console.log, err = console.error, probe, sleep = pause } = {}) => {
+// Returns the exit code: 0 done, 75 busy, 1 refused (also a command the judge stops), 2 usage; `run` returns its command's code, as a promise
+// when `spawn` gives one (the real one does, so signals reach it). `job` is a detached job's wrapper hooks: `proceed()` (false skips the command),
+// `started({ pid })`, `exited(code)` (before the slot is freed).
+export const main = (argv, { settings, now: nowGiven, load = loadavg()[0], busiest = busiestProcess, spawn = defaultSpawn, refusal = defaultRefusal, out = console.log, err = console.error, probe, sleep = pause, uncapped = false, command: isCmd = false, job } = {}) => {
   const [verb, ...args] = argv;
   const now = nowGiven ?? new Date();
   const clock = nowGiven === undefined ? () => new Date() : undefined;
   const opts = parse(args);
   const dir = verb === "keep" ? opts?.dir : lockDir(settings);
   const resource = opts?.rest[0];
-  if (!opts || (verb !== "keep" && (opts.dir !== undefined || opts.every !== undefined || opts.start !== undefined || opts.boot !== undefined)) || (verb !== "take" && opts.worker !== undefined) || (verb !== "status" && !RESOURCE.test(resource ?? ""))) {
+  if (!opts || (verb !== "keep" && (opts.dir !== undefined || opts.every !== undefined || opts.start !== undefined || opts.boot !== undefined || opts.guard)) || (verb !== "take" && opts.worker !== undefined) || (verb !== "status" && opts.json) || (verb !== "status" && !RESOURCE.test(resource ?? ""))) {
     err(USAGE);
     return 2;
   }
@@ -611,7 +956,13 @@ export const main = (argv, { settings, now: nowGiven, load = loadavg()[0], busie
     const files = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".json")).map((f) => f.slice(0, -5)) : [];
     const names = safe === undefined ? files : files.filter((name) => name === safe || name.startsWith(`${safe}~`));
     const lines = names.map((name) => [name, holder(dir, name)]).filter(([, held]) => held && !stale(held, now, probe));
-    out(lines.length === 0 ? "no locks held" : lines.map(([name, held]) => `${name}: ${describeHolder(held)} until ${held.until}`).join("\n"));
+    if (opts.json) {
+      out(JSON.stringify(snapshot({ dir, settings, now, probe, load, only: resource })));
+      return 0;
+    }
+    const line = tickets(dir, now).filter((ticket) => resource === undefined || ticket.resource === resource);
+    const queued = [...new Set(line.map((ticket) => ticket.resource))].map((name) => `${name}: waiting, first come first: ${line.filter((ticket) => ticket.resource === name).map((ticket) => `${ticket.as} since ${ticket.at}`).join(", ")}`);
+    out([lines.length === 0 ? "no locks held" : lines.map(([name, held]) => `${name}: ${describeHolder(held)} until ${held.until}`).join("\n"), ...queued].join("\n"));
     return 0;
   }
   if (verb === "waive") {
@@ -639,11 +990,33 @@ export const main = (argv, { settings, now: nowGiven, load = loadavg()[0], busie
     const gone = opts.start === undefined ? () => !alive(opts.pid) : () => workerState({ pid: opts.pid, start: opts.start, boot: opts.boot }, probe) === "dead";
     // The end a --ttl set goes in the record too, so it holds even if this keeper is killed.
     const capped = opts.until === undefined ? {} : { cap: opts.until };
+    // A guard's run is gone: stop its command (the run's record names it), and only then free the slot. The record's `guard` is this keeper
+    // until then, so the slot stays held while the command leaves.
+    const release = () => {
+      if (!opts.guard) return;
+      const held = slotNames(opts.rest[0], MAX_SLOTS).map((name) => holder(dir, name)).find((record) => record?.id === opts.id);
+      if (!held) return;
+      if (held.group && typeof held.group.pid === "number") stopGroup(held.group, sleep, undefined, probe);
+      free({ dir, resource, as: held.as, id: opts.id });
+    };
     // Name this keeper in the record, so a repeated take for the same worker does not start a second one.
-    if (gone() || !refreshHolder({ dir, resource, id: opts.id, extra: { keeper: process.pid, ...capped } })) return 0;
+    if (gone()) {
+      release();
+      return 0;
+    }
+    if (!refreshHolder({ dir, resource, id: opts.id, extra: { keeper: process.pid, ...(opts.guard ? { guard: process.pid } : {}), ...capped } })) return 0;
+    // A guard looks every second whether its run is there; the renewal stays on its own `every`.
+    const tick = opts.guard ? Math.min(every, GUARD_TICK_MS) : every;
+    let renewed = Date.now();
     for (;;) {
-      sleep(every);
-      if (gone() || Date.now() >= cap || !refreshHolder({ dir, resource, id: opts.id, extra: capped })) return 0;
+      sleep(tick);
+      if (gone()) {
+        release();
+        return 0;
+      }
+      if (opts.guard && Date.now() - renewed < every) continue;
+      renewed = Date.now();
+      if (Date.now() >= cap || !refreshHolder({ dir, resource, id: opts.id, extra: capped })) return 0;
     }
   }
   if (verb === "take" || verb === "run") {
@@ -652,7 +1025,7 @@ export const main = (argv, { settings, now: nowGiven, load = loadavg()[0], busie
       return 2;
     }
     if (slotsFixed(resource, settings) && opts.slots !== undefined) {
-      err(`beefy-slot: ${resource}'s slots are the machine's (resources.${resource}.slots in beefy-slot.json), not a flag`);
+      err(`beefy-slot: ${resource}'s slots are the machine's (resources.${resource}.slots in the config file), not a flag`);
       return 2;
     }
     if (resource === PERF && opts.worker !== undefined) {
@@ -716,19 +1089,48 @@ export const main = (argv, { settings, now: nowGiven, load = loadavg()[0], busie
     if (heldBy({ dir, resource, settings, now })) return start({ env: { ...settings.childEnv, ...Object.fromEntries(settings.heldNames.map((name) => [name, settings.held])) } });
     const as = opts.as ?? `run:${process.pid}`;
     const id = randomUUID();
-    const taken = take({ dir, resource, as, id, watch: process.pid, ttl: HEARTBEAT_TTL_MINUTES, now, clock, load, loadMax, busiest, ignoreLoad: opts.ignoreLoad, reason: opts.reason, ...queue(opts, settings) });
+    // A command run says where it stands in line: one line, rewritten in place on a terminal.
+    const tty = isCmd && process.stderr.isTTY;
+    let shown = "";
+    const onWait = isCmd ? ({ ahead, reason }) => {
+      // The hold is the load line when nobody is ahead and the refusal says so.
+      const load = ahead === 0 && /^the machine is busy: 1-minute load is ([\d.]+), above the limit of ([\d.]+)(?:; busiest process: (.*))?\. Try again later\.$/.exec(reason ?? "");
+      const line = load ? `waiting: load ${load[1]} over ${load[2]}${load[3] ? ` (busiest: ${load[3]})` : ""}` : `waiting: ${ahead} ahead on ${resource}`;
+      if (line === shown) return;
+      shown = line;
+      process.stderr.write(tty ? `\r\x1b[2K${line}` : `${line}\n`);
+    } : undefined;
+    const taken = take({ dir, resource, as, id, watch: process.pid, ttl: HEARTBEAT_TTL_MINUTES, now, clock, load, loadMax, onWait, uncapped, busiest, ignoreLoad: opts.ignoreLoad, reason: opts.reason, ...queue(opts, settings) });
+    if (tty && shown) process.stderr.write("\r\x1b[2K");
     if (!taken.ok) {
       err(`beefy-slot: ${taken.reason}`);
       return BUSY;
     }
     // Freed even when the command fails. A kill of this process leaves its pid dead, which frees the lock for the next taker.
+    const finish = (code) => {
+      try {
+        job?.exited?.(code);
+      } finally {
+        free({ dir, resource, as, id });
+      }
+      return code;
+    };
+    let ran;
     try {
       const held = [settings.held, `${resource}=${id}`].filter(Boolean).join(",");
       const until = opts.ttlGiven ? new Date(Date.now() + opts.ttl * 60_000).toISOString() : undefined;
-      return start({ env: { ...settings.childEnv, ...Object.fromEntries(settings.heldNames.map((name) => [name, held])) }, keep: { resource, id, until, dir, every: settings.heartbeatSeconds } });
-    } finally {
+      ran = job?.proceed && !job.proceed() ? 143 : start({ env: { ...settings.childEnv, ...Object.fromEntries(settings.heldNames.map((name) => [name, held])) }, keep: { resource, id, until, dir, every: settings.heartbeatSeconds }, onChild: job?.started });
+    } catch (error) {
       free({ dir, resource, as, id });
+      throw error;
     }
+    if (typeof ran?.then === "function") {
+      return ran.then(finish, (error) => {
+        free({ dir, resource, as, id });
+        throw error;
+      });
+    }
+    return finish(ran);
   }
   err(USAGE);
   return 2;

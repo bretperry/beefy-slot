@@ -6,7 +6,7 @@
 import "./tmpdir.mjs";
 import assert from "node:assert/strict";
 import { spawn as start, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -238,7 +238,8 @@ describe("a waiting take watches its worker", () => {
     call.stderr.on("data", (chunk) => (stderr += chunk));
     const closed = new Promise((resolve) => call.on("close", resolve));
     try {
-      await new Promise((resolve) => setTimeout(resolve, 600));
+      // Waiting means its ticket is in the line; a fixed pause is not proof, since a loaded machine can still be starting node.
+      await waitFor(() => existsSync(join(dir, "tickets")) && readdirSync(join(dir, "tickets")).some((name) => name.startsWith("ci~")), "the take to queue");
       assert.equal(call.exitCode, null, "still waiting while its worker lives");
       const killedAt = Date.now();
       await kill(waiter);
@@ -321,7 +322,7 @@ describe("a slot count from the config", () => {
     assert.equal(run(["take", "ci", "--as", "b"], { config: cfg }), 0);
     assert.equal(run(["take", "ci", "--as", "c"], { config: cfg }), BUSY);
     assert.equal(run(["take", "ci", "--as", "d", "--slots", "5"], { config: cfg }), 2);
-    assert.match(errors.join("\n"), /ci's slots are the machine's \(resources\.ci\.slots in beefy-slot\.json\), not a flag/);
+    assert.match(errors.join("\n"), /ci's slots are the machine's \(resources\.ci\.slots in the config file\), not a flag/);
     assert.equal(run(["run", "ci", "--as", "e", "--slots", "5", "--", "true"], { config: cfg }), 2);
     assert.equal(holder(dir, "ci").as, "a");
     assert.equal(holder(dir, "ci~1").as, "b");
