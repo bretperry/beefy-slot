@@ -761,10 +761,10 @@ const parse = (args) => {
 
 // Starts the process that renews a lock while its run (this process) or its `worker` lives; null when it can't start.
 // With `guard` it also looks every second, and when the run is gone it stops the run's command (see `stopGroup`) and then frees the slot.
-const startKeeper = ({ resource, id, until, dir, every, worker, guard }, env) => {
+const startKeeper = ({ resource, id, until, ttl, dir, every, worker, guard }, env) => {
   try {
     const watched = worker ? ["--pid", String(worker.pid), "--start", worker.start, "--boot", worker.boot] : ["--pid", String(process.pid)];
-    const child = spawnAsync(process.execPath, [fileURLToPath(import.meta.url), "keep", resource, "--id", id, ...watched, "--dir", dir, "--every", String(every), ...(until ? ["--until", until] : []), ...(guard ? ["--guard"] : [])], { detached: true, stdio: "ignore", env });
+    const child = spawnAsync(process.execPath, [fileURLToPath(import.meta.url), "keep", resource, "--id", id, ...watched, "--dir", dir, "--every", String(every), ...(until ? ["--until", until] : []), ...(ttl ? ["--ttl", String(ttl)] : []), ...(guard ? ["--guard"] : [])], { detached: true, stdio: "ignore", env });
     child.on("error", () => {});
     child.unref();
     return child.pid === undefined ? null : child;
@@ -849,7 +849,7 @@ const FORWARDED = ["SIGTERM", "SIGINT", "SIGHUP"];
 // so it is in the foreground (a tty prompt works, Ctrl-C and Ctrl-Z reach it as they would the plain command); there SIGTERM and SIGHUP go to the
 // command and the processes below it, and SIGINT is left to the terminal, which has already sent it. The record names the command's group, so
 // if this process is killed outright (SIGKILL) its guard stops the command before the slot frees. `onChild({ pid })` is told once the command exists.
-const defaultSpawn = (command, { env, keep, onChild }) => new Promise((resolve) => {
+const defaultSpawn = (command, { env, keep, keeper: started, onChild }) => new Promise((resolve) => {
   const posix = process.platform !== "win32";
   const shared = posix && Boolean(process.stdin.isTTY || process.stdout.isTTY || process.stderr.isTTY);
   const handlers = [];
@@ -879,7 +879,8 @@ const defaultSpawn = (command, { env, keep, onChild }) => new Promise((resolve) 
     console.error(`beefy-slot: could not start ${command[0]}: ${error.message}`);
     settle(1);
   };
-  keeper = keep ? startKeeper({ ...keep, guard: true }, env) : null;
+  // `run` starts the guard before its take and passes it in; one is started here only when it didn't.
+  keeper = started ?? (keep ? defaultSpawn.guard(keep, env) : null);
   try {
     child = spawnAsync(command[0], command.slice(1), { stdio: ["ignore", "inherit", "inherit"], env, shell: !posix, detached: posix && !shared });
   } catch (error) {
@@ -899,6 +900,9 @@ const defaultSpawn = (command, { env, keep, onChild }) => new Promise((resolve) 
   if (identity) record({ group: { pid: child.pid, tree: shared, start: identity.start, boot: identity.boot } });
   onChild?.({ pid: child.pid, identity });
 });
+// The real spawn's guard: a keeper that renews `keep`'s lock and, if the run is killed, stops its command and frees the slot.
+// `run` calls it before the take; a test's spawn has none, so no keeper process is started for it.
+defaultSpawn.guard = (keep, env) => startKeeper({ ...keep, guard: true }, env);
 
 // Words that are verbs, not commands; `keep` and `job` are internal (a lock's renewer, a detached job's wrapper).
 const VERBS = ["take", "free", "run", "status", "waive", "perf", "config", "log", "jobs", "cancel", "help", "keep", "job"];
@@ -984,12 +988,17 @@ export const main = (argv, { settings, now: nowGiven, load = loadavg()[0], busie
       return 2;
     }
     const every = opts.every * 1000;
-    const cap = opts.until === undefined ? Number.POSITIVE_INFINITY : Date.parse(opts.until);
+    let cap = Number.POSITIVE_INFINITY;
     // With --start and --boot the process watched is a worker, told from a later one by its start time.
     // It stops only when the process is known to be gone: a look that fails (ps slow on a loaded machine) keeps renewing.
     const gone = opts.start === undefined ? () => !alive(opts.pid) : () => workerState({ pid: opts.pid, start: opts.start, boot: opts.boot }, probe) === "dead";
     // The end a --ttl set goes in the record too, so it holds even if this keeper is killed.
-    const capped = opts.until === undefined ? {} : { cap: opts.until };
+    let capped = {};
+    const capAt = (until) => {
+      cap = until === undefined ? Number.POSITIVE_INFINITY : Date.parse(until);
+      capped = until === undefined ? {} : { cap: until };
+    };
+    capAt(opts.until);
     // A guard's run is gone: stop its command (the run's record names it), and only then free the slot. The record's `guard` is this keeper
     // until then, so the slot stays held while the command leaves.
     const release = () => {
@@ -1004,7 +1013,15 @@ export const main = (argv, { settings, now: nowGiven, load = loadavg()[0], busie
       release();
       return 0;
     }
-    if (!refreshHolder({ dir, resource, id: opts.id, extra: { keeper: process.pid, ...(opts.guard ? { guard: process.pid } : {}), ...capped } })) return 0;
+    // A guard starts before its run's take (a kill between the take and a later start would leave the record with no one to free it), so
+    // its record may not exist yet while the run waits in line: it looks again each tick, and frees it if the run dies first. A guard's
+    // --ttl counts from the take, when the record appears.
+    const claim = () => {
+      if (opts.guard && opts.ttlGiven) capAt(new Date(Date.now() + opts.ttl * 60_000).toISOString());
+      return refreshHolder({ dir, resource, id: opts.id, extra: { keeper: process.pid, ...(opts.guard ? { guard: process.pid } : {}), ...capped } });
+    };
+    let claimed = claim();
+    if (!claimed && !opts.guard) return 0;
     // A guard looks every second whether its run is there; the renewal stays on its own `every`.
     const tick = opts.guard ? Math.min(every, GUARD_TICK_MS) : every;
     let renewed = Date.now();
@@ -1013,6 +1030,11 @@ export const main = (argv, { settings, now: nowGiven, load = loadavg()[0], busie
       if (gone()) {
         release();
         return 0;
+      }
+      if (!claimed) {
+        claimed = claim();
+        renewed = Date.now();
+        continue;
       }
       if (opts.guard && Date.now() - renewed < every) continue;
       renewed = Date.now();
@@ -1100,36 +1122,43 @@ export const main = (argv, { settings, now: nowGiven, load = loadavg()[0], busie
       shown = line;
       process.stderr.write(tty ? `\r\x1b[2K${line}` : `${line}\n`);
     } : undefined;
+    const held = [settings.held, `${resource}=${id}`].filter(Boolean).join(",");
+    const env = { ...settings.childEnv, ...Object.fromEntries(settings.heldNames.map((name) => [name, held])) };
+    const keep = { resource, id, ttl: opts.ttlGiven ? opts.ttl : undefined, dir, every: settings.heartbeatSeconds };
+    // The guard starts before the take, not after it: a run killed between its take and a later start would leave a record no one frees.
+    let keeper = null;
+    try {
+      keeper = spawn.guard?.(keep, env) ?? null;
+    } catch {}
     const taken = take({ dir, resource, as, id, watch: process.pid, ttl: HEARTBEAT_TTL_MINUTES, now, clock, load, loadMax, onWait, uncapped, busiest, ignoreLoad: opts.ignoreLoad, reason: opts.reason, ...queue(opts, settings) });
     if (tty && shown) process.stderr.write("\r\x1b[2K");
     if (!taken.ok) {
+      keeper?.kill();
       err(`beefy-slot: ${taken.reason}`);
       return BUSY;
     }
-    // Freed even when the command fails. A kill of this process leaves its pid dead, which frees the lock for the next taker.
+    // Freed even when the command fails. A kill of this process leaves its pid dead, and its guard frees the lock for the next taker.
     const finish = (code) => {
       try {
         job?.exited?.(code);
       } finally {
+        keeper?.kill();
         free({ dir, resource, as, id });
       }
       return code;
     };
-    let ran;
-    try {
-      const held = [settings.held, `${resource}=${id}`].filter(Boolean).join(",");
-      const until = opts.ttlGiven ? new Date(Date.now() + opts.ttl * 60_000).toISOString() : undefined;
-      ran = job?.proceed && !job.proceed() ? 143 : start({ env: { ...settings.childEnv, ...Object.fromEntries(settings.heldNames.map((name) => [name, held])) }, keep: { resource, id, until, dir, every: settings.heartbeatSeconds }, onChild: job?.started });
-    } catch (error) {
+    const fail = (error) => {
+      keeper?.kill();
       free({ dir, resource, as, id });
       throw error;
+    };
+    let ran;
+    try {
+      ran = job?.proceed && !job.proceed() ? 143 : start({ env, keep, keeper, onChild: job?.started });
+    } catch (error) {
+      fail(error);
     }
-    if (typeof ran?.then === "function") {
-      return ran.then(finish, (error) => {
-        free({ dir, resource, as, id });
-        throw error;
-      });
-    }
+    if (typeof ran?.then === "function") return ran.then(finish, fail);
     return finish(ran);
   }
   err(USAGE);

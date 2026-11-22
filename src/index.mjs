@@ -23,7 +23,7 @@ const DIR_ERRORS = ["ENOTDIR", "EEXIST", "EACCES", "EPERM", "EROFS", "ENOENT", "
 // True when the error's path is the lockDir, something inside it, or a parent on the way to it (its creation).
 const aboutLockDir = (error, dir) => typeof error?.path === "string" && (error.path === dir || error.path.startsWith(dir + sep) || dir.startsWith(error.path.endsWith(sep) ? error.path : error.path + sep));
 
-export const VERSION = "0.4.0";
+export const VERSION = "0.4.1";
 
 export const main = (argv, options = {}) => {
   if (argv[0] === "--version") {
