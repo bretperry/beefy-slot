@@ -74,7 +74,7 @@ beefy status
 ```
 
 ```
-beefy-slot 0.4.0 · folder ~/.beefy-slot/locks · judge none
+beefy-slot 0.4.1 · folder ~/.beefy-slot/locks · judge none
 heavy: run:48213 until 2026-11-21T01:36:09.277Z
 ```
 

@@ -498,8 +498,53 @@ describe("lock: a run keeps its slot for as long as it lives and not a minute af
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     }
-    // The run's guard stops its command (a second or two), then frees the slot: the next taker gets it without waiting out the hour.
-    await waitFor(() => take({ dir, resource: "dead", as: "b", now: new Date(), load: 0 }).ok, "the dead run's lock to go to the next taker");
+    // The run's guard stops its command (a second or two), then frees the slot: the record is gone, not only stale, and the next
+    // taker gets it without waiting out the hour.
+    await waitFor(() => holder(dir, "dead") === null, "the dead run's guard to remove its record");
+    assert.equal(take({ dir, resource: "dead", as: "b", now: new Date(), load: 0 }).ok, true);
+  });
+
+  it("run starts its guard before the take, hands it to the spawn, and stops it when the take fails", () => {
+    const { dir, run } = setup();
+    const env = { BEEFY_SLOT_LOCK_DIR: dir };
+    const real = new Date();
+    const calls = [];
+    const guard = (keep) => {
+      calls.push(["guard", keep.id, holder(dir, "g")]);
+      return { pid: 1, kill: () => calls.push(["kill"]) };
+    };
+    const spawn = Object.assign((_command, { keep, keeper }) => (calls.push(["spawn", keep.id, keeper?.pid, holder(dir, "g")?.id]), 0), { guard });
+    assert.equal(run(["run", "g", "--as", "a", "--", "true"], { env, now: real, spawn }), 0);
+    const [first, second, third] = calls;
+    assert.deepEqual(first, ["guard", second[1], null], "the guard exists before the record does");
+    assert.deepEqual(second, ["spawn", first[1], 1, first[1]], "the spawn gets that guard, and the record is the guard's id");
+    assert.deepEqual(third, ["kill"], "and it is stopped once the run ends");
+    // A take that fails stops the guard it started.
+    calls.length = 0;
+    run(["take", "g", "--as", "x"], { env, now: real });
+    assert.equal(run(["run", "g", "--as", "b", "--", "true"], { env, now: real, spawn }), BUSY);
+    assert.deepEqual(calls.map(([name]) => name), ["guard", "kill"]);
+  });
+
+  it("a guard started before its run's take waits for the record, then frees it when the run dies", async () => {
+    const { dir } = setup();
+    const env = { ...process.env, BEEFY_SLOT_LOCK_DIR: dir };
+    // The run: a process this test kills. Its guard is started first, while no record exists.
+    const runner = start(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+    const guard = start(process.execPath, ["bin/beefy-slot.mjs", "keep", "early", "--id", "early-id", "--pid", String(runner.pid), "--dir", dir, "--every", "1", "--ttl", "5", "--guard"], { env, stdio: "ignore" });
+    const guardDone = new Promise((resolve) => guard.on("close", resolve));
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      assert.equal(guard.exitCode, null, "no record yet: the guard keeps waiting instead of leaving");
+      assert.equal(take({ dir, resource: "early", as: "a", id: "early-id", watch: runner.pid, ttl: HEARTBEAT_TTL_MINUTES, now: new Date(), load: 0 }).ok, true);
+      const claimed = await waitFor(() => holder(dir, "early")?.guard === guard.pid && holder(dir, "early"), "the guard to claim the record");
+      assert.ok(Date.parse(claimed.cap) > Date.now() + 4 * 60_000, "--ttl counts from the claim");
+      runner.kill("SIGKILL");
+      await waitFor(() => holder(dir, "early") === null, "the guard to free the dead run's record", 10_000);
+      assert.equal(await guardDone, 0);
+    } finally {
+      for (const child of [runner, guard]) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }
   });
 });
 
